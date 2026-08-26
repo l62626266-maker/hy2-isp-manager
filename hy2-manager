@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly APP_NAME="HY2 ISP Manager"
-readonly APP_VERSION="0.1.0-beta.2"
+readonly APP_VERSION="0.1.0-beta.3"
 readonly APP_DIR="${HY2M_APP_DIR:-/opt/hy2-isp-manager}"
 readonly STATE_DIR="${HY2M_STATE_DIR:-/etc/hy2-isp-manager}"
 readonly NODE_DIR="$STATE_DIR/nodes"
@@ -183,17 +183,34 @@ close_firewall() {
   tmp=$(mktemp); cleanup_files+=("$tmp"); grep -Fxv "$rule" "$FIREWALL_STATE" >"$tmp" || true; install -o root -g root -m 600 "$tmp" "$FIREWALL_STATE"
 }
 
+is_restricted_container() {
+  command -v systemd-detect-virt >/dev/null 2>&1 || return 1
+  systemd-detect-virt --container >/dev/null 2>&1
+}
+try_network_sysctl() {
+  local key=$1 value=$2 file=$3
+  if sysctl -w "$key=$value" >/dev/null 2>&1; then printf '%s = %s\n' "$key" "$value" >>"$file"; return 0; fi
+  warn "宿主机不允许修改 $key，已跳过。"; return 1
+}
 configure_network() {
-  local mem_kb swap_mb=0
+  local mem_kb swap_mb=0 applied=0 tmp
+  if is_restricted_container; then
+    rm -f "$SYSCTL_FILE"
+    warn "检测到 LXC/LXD/OpenVZ 等受限容器；BBR、net.core 缓冲和真实 Swap 由宿主机管理，已安全跳过网络优化。"
+    return 0
+  fi
+  tmp=$(mktemp); cleanup_files+=("$tmp")
+  printf '# Managed by HY2 ISP Manager. Conservative QUIC buffers; no custom kernel.\n' >"$tmp"
+  if try_network_sysctl net.core.rmem_max 16777216 "$tmp"; then applied=1; fi
+  if try_network_sysctl net.core.wmem_max 16777216 "$tmp"; then applied=1; fi
+  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    if try_network_sysctl net.core.default_qdisc fq "$tmp"; then applied=1; fi
+    if try_network_sysctl net.ipv4.tcp_congestion_control bbr "$tmp"; then applied=1; fi
+  else
+    warn "当前内核不支持 BBR，已保留原拥塞控制。"
+  fi
+  if ((applied)); then install -o root -g root -m 644 "$tmp" "$SYSCTL_FILE"; fi
   mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-  cat >"$SYSCTL_FILE" <<'EOF'
-# Managed by HY2 ISP Manager. Conservative QUIC buffers; no custom kernel.
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-  sysctl --system >/dev/null
   if (( mem_kb < 1500000 )) && ! swapon --show=NAME --noheadings | grep -q .; then
     (( mem_kb < 750000 )) && swap_mb=768 || swap_mb=512
     if [[ ! -f $SWAP_FILE ]]; then

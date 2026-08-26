@@ -57,6 +57,9 @@ if grep -Eq 'python3[^#]*\$SOCKS_PASS' hy2-manager; then fail "SOCKS password ex
 grep -Fq 'dns_cloudflare_api_token' hy2-manager && pass "Cloudflare DNS-01 supported" || fail "Cloudflare DNS-01 supported"
 grep -Fq 'PUBLIC_PORT' hy2-manager && grep -Fq 'LISTEN_PORT' hy2-manager && pass "public/listen ports separated" || fail "public/listen ports separated"
 grep -Fq 'sha256sum "$binary"' hy2-manager && pass "Hysteria checksum verification" || fail "Hysteria checksum verification"
+grep -Fq 'systemd-detect-virt --container' hy2-manager && pass "restricted container detection" || fail "restricted container detection"
+if grep -Fq 'sysctl --system' hy2-manager; then fail "must not reapply unrelated sysctl files"; else pass "no global sysctl replay"; fi
+grep -Fq 'try_network_sysctl net.core.rmem_max 16777216' hy2-manager && pass "conservative QUIC buffer attempt" || fail "conservative QUIC buffer attempt"
 
 if (( failures )); then printf '\n%d test(s) failed.\n' "$failures" >&2; exit 1; fi
 printf '\nAll tests passed.\n'

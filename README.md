@@ -8,7 +8,7 @@
 - Let’s Encrypt HTTP-01 与 Cloudflare DNS-01；
 - v2rayN URI、终端二维码、状态、诊断、备份和安全卸载。
 
-> 当前版本：`v0.1.0-beta.2`。已通过 Bash 语法、ShellCheck 和本地契约测试；真实公网/NAT、证书签发和不同 ISP 服务商仍应先在可重装测试 VPS 上验证。不要先在唯一的生产 VPS 上运行 Beta 版。
+> 当前版本：`v0.1.0-beta.3`。已通过 Bash 语法、ShellCheck 和本地契约测试；真实公网/NAT、证书签发和不同 ISP 服务商仍应先在可重装测试 VPS 上验证。不要先在唯一的生产 VPS 上运行 Beta 版。
 
 ## 支持环境
 
@@ -23,7 +23,7 @@
 固定版本发布后：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/v0.1.0-beta.2/install.sh -o /tmp/hy2-install.sh
+curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/v0.1.0-beta.3/install.sh -o /tmp/hy2-install.sh
 bash -n /tmp/hy2-install.sh
 sudo bash /tmp/hy2-install.sh
 ```
@@ -153,11 +153,11 @@ ISP 节点配置只定义 SOCKS5 outbound，并使用该 outbound 匹配 `all`�
 
 ## 网络优化
 
-脚本只设置保守参数：
+脚本只设置保守参数。LXC、LXD、OpenVZ 等受限容器的 BBR、`net.core` 缓冲和真实 Swap 由宿主机管理，脚本会自动识别并安全跳过，不影响节点继续部署：
 
 ```text
 BBR + fq
-QUIC rmem_max/wmem_max = 16 MiB
+QUIC rmem_max/wmem_max = 16 MiB（完整 VM 且内核允许时）
 低内存且没有 Swap 时创建独立 Swap
 ```
 
