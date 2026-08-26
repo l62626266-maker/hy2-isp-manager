@@ -53,6 +53,7 @@ if grep -Fq 'insecure=1' hy2-manager; then fail "no insecure client URI"; else p
 grep -Fq 'printf '\''acl:\n  inline:\n    - %s(all)\n'\''' hy2-manager && pass "ISP ACL is explicit all" || fail "ISP ACL is explicit all"
 if awk '/create_isp\(\)/,/^}/' hy2-manager | grep -Fq 'type: direct'; then fail "ISP block has direct fallback"; else pass "ISP block has no direct fallback"; fi
 grep -Fq 'SOCKS_PASS=$(ask_secret' hy2-manager && pass "SOCKS password hidden input" || fail "SOCKS password hidden input"
+if grep -Eq 'python3[^#]*\$SOCKS_PASS' hy2-manager; then fail "SOCKS password exposed in process arguments"; else pass "SOCKS password absent from process arguments"; fi
 grep -Fq 'dns_cloudflare_api_token' hy2-manager && pass "Cloudflare DNS-01 supported" || fail "Cloudflare DNS-01 supported"
 grep -Fq 'PUBLIC_PORT' hy2-manager && grep -Fq 'LISTEN_PORT' hy2-manager && pass "public/listen ports separated" || fail "public/listen ports separated"
 grep -Fq 'sha256sum "$binary"' hy2-manager && pass "Hysteria checksum verification" || fail "Hysteria checksum verification"

@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly APP_NAME="HY2 ISP Manager"
-readonly APP_VERSION="0.1.0-beta.1"
+readonly APP_VERSION="0.1.0-beta.2"
 readonly APP_DIR="${HY2M_APP_DIR:-/opt/hy2-isp-manager}"
 readonly STATE_DIR="${HY2M_STATE_DIR:-/etc/hy2-isp-manager}"
 readonly NODE_DIR="$STATE_DIR/nodes"
@@ -367,9 +367,14 @@ read_socks() {
   [[ -n $SOCKS_USER && $SOCKS_USER != *:* && -n $SOCKS_PASS ]] || die "SOCKS5 用户名或密码无效。"
 }
 probe_socks_udp() {
-  python3 - "$SOCKS_HOST" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS" <<'PY'
+  local cred
+  cred=$(mktemp); cleanup_files+=("$cred")
+  printf '%s\n%s\n%s\n%s\n' "$SOCKS_HOST" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS" >"$cred"; chmod 600 "$cred"
+  python3 - "$cred" <<'PY'
 import socket, struct, sys
-h,p,u,w=sys.argv[1],int(sys.argv[2]),sys.argv[3].encode(),sys.argv[4].encode()
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    h, port, user, password = f.read().splitlines()
+p,u,w=int(port),user.encode(),password.encode()
 def rx(s,n):
  d=b''
  while len(d)<n:

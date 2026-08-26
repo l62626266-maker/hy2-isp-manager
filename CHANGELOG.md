@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.0-beta.2
+
+- 修复 SOCKS5 UDP 探测曾通过进程参数传递凭据的问题，改为仅 root 可读临时文件。
+- 增加公网 IPv4 严格校验和 NAT 公网端口冲突检测。
+- 增加现有证书安全复用、IPv6 SOCKS5 地址格式和直连节点补建入口。
+- 明确应用层无 direct fallback 不等于内核级出站隔离。
+
 ## v0.1.0-beta.1
 
 - 首个公开 Beta。
