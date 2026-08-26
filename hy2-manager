@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly APP_NAME="HY2 ISP Manager"
-readonly APP_VERSION="0.1.0-beta.4"
+readonly APP_VERSION="0.1.0-beta.5"
 readonly APP_DIR="${HY2M_APP_DIR:-/opt/hy2-isp-manager}"
 readonly STATE_DIR="${HY2M_STATE_DIR:-/etc/hy2-isp-manager}"
 readonly NODE_DIR="$STATE_DIR/nodes"
@@ -293,11 +293,19 @@ ExecStart=$HYSTERIA_BIN server -c $config
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
+EOF
+  if ! is_restricted_container; then
+    cat >>"/etc/systemd/system/$service" <<EOF
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 ReadOnlyPaths=$HYSTERIA_DIR
 ReadWritePaths=/var/lib/hysteria
+EOF
+  else
+    printf '# Filesystem namespace hardening omitted: restricted container blocks CLONE_NEWNS.\n' >>"/etc/systemd/system/$service"
+  fi
+  cat >>"/etc/systemd/system/$service" <<EOF
 Nice=-5
 LimitNOFILE=1048576
 Restart=on-failure

@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="v0.1.0-beta.4"
+readonly VERSION="v0.1.0-beta.5"
 readonly REPO="l62626266-maker/hy2-isp-manager"
-readonly MANAGER_SHA256="77f10ff9937b7cd95eae2670985fb5e85be67c039609f80f47449c70b0446b1c"
+readonly MANAGER_SHA256="e810cdbe6e313f4cebe5bd6c531ac369dbe947df8ed14dd5d63686f38b9782e5"
 
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行。"

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.0-beta.5
+
+- 修复受限 LXD 容器禁止 systemd mount namespace 时 HY2 服务启动失败的问题。
+- 完整 VM 继续启用 `PrivateTmp`、`ProtectSystem` 等文件系统隔离；受限容器仅省略不兼容项，保留专用用户、能力边界和 `NoNewPrivileges`。
+
 ## v0.1.0-beta.4
 
 - 修复旧状态文件中的 `APP_VERSION` 与管理器只读版本变量冲突。
