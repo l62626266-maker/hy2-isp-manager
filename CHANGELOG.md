@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.0
+
+- 首个稳定版本。
+- 在一次性 LXD NAT VPS 验证证书、旧状态兼容、直连节点创建、systemd 启动及 UDP 监听。
+- 纳入 beta.1 至 beta.5 的安全、NAT、ISP 全隧道、回滚和受限容器兼容修复。
+
 ## v0.1.0-beta.5
 
 - 修复受限 LXD 容器禁止 systemd mount namespace 时 HY2 服务启动失败的问题。

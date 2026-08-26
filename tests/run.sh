@@ -42,7 +42,7 @@ source "$STATE_DIR/test.env"
 [[ $(stat -c '%a' "$STATE_DIR/test.env") == 600 ]] && pass "state mode 600" || fail "state mode 600"
 write_env "$MANAGER_STATE" APP_VERSION 'legacy-beta' DOMAIN 'state.example.com' PUBLIC_IP '192.0.2.1' NETWORK_MODE nat CERT_MODE cloudflare
 load_manager
-[[ $APP_VERSION == '0.1.0-beta.5' && $DOMAIN == 'state.example.com' ]] && pass "legacy APP_VERSION state compatibility" || fail "legacy APP_VERSION state compatibility"
+[[ $APP_VERSION == '0.1.0' && $DOMAIN == 'state.example.com' ]] && pass "legacy APP_VERSION state compatibility" || fail "legacy APP_VERSION state compatibility"
 mkdir -p "$NODE_DIR"; printf 'PUBLIC_PORT=56777\n' >"$NODE_DIR/nat.env"
 if public_port_free 56777; then fail "reject duplicate NAT public port"; else pass "reject duplicate NAT public port"; fi
 check "allow unused NAT public port" public_port_free 56778
