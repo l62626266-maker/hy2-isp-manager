@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly APP_NAME="HY2 ISP Manager"
-readonly APP_VERSION="0.1.0"
+readonly APP_VERSION="0.1.1"
 readonly APP_DIR="${HY2M_APP_DIR:-/opt/hy2-isp-manager}"
 readonly STATE_DIR="${HY2M_STATE_DIR:-/etc/hy2-isp-manager}"
 readonly NODE_DIR="$STATE_DIR/nodes"
@@ -501,7 +501,7 @@ show_nodes() {
     [[ -z ${SOCKS_EXIT_IP:-} ]] || printf '  ISP 出口: %s  SOCKS UDP: %s\n' "$SOCKS_EXIT_IP" "${SOCKS_UDP:-unknown}"
     if confirm "显示 $NAME 的完整敏感导入链接和二维码？"; then
       uri=$(<"$URI_FILE"); printf '%s\n' "$uri"
-      if command -v qrencode >/dev/null && is_tty; then printf '%s' "$uri" | qrencode -t ANSIUTF8 -r - || true; fi
+      if command -v qrencode >/dev/null && is_tty; then printf '%s' "$uri" | qrencode -t ANSIUTF8 || true; fi
     fi
   done
 }

@@ -42,7 +42,7 @@ source "$STATE_DIR/test.env"
 [[ $(stat -c '%a' "$STATE_DIR/test.env") == 600 ]] && pass "state mode 600" || fail "state mode 600"
 write_env "$MANAGER_STATE" APP_VERSION 'legacy-beta' DOMAIN 'state.example.com' PUBLIC_IP '192.0.2.1' NETWORK_MODE nat CERT_MODE cloudflare
 load_manager
-[[ $APP_VERSION == '0.1.0' && $DOMAIN == 'state.example.com' ]] && pass "legacy APP_VERSION state compatibility" || fail "legacy APP_VERSION state compatibility"
+[[ $APP_VERSION == '0.1.1' && $DOMAIN == 'state.example.com' ]] && pass "legacy APP_VERSION state compatibility" || fail "legacy APP_VERSION state compatibility"
 mkdir -p "$NODE_DIR"; printf 'PUBLIC_PORT=56777\n' >"$NODE_DIR/nat.env"
 if public_port_free 56777; then fail "reject duplicate NAT public port"; else pass "reject duplicate NAT public port"; fi
 check "allow unused NAT public port" public_port_free 56778
@@ -65,6 +65,8 @@ if grep -Fq 'sysctl --system' hy2-manager; then fail "must not reapply unrelated
 grep -Fq 'try_network_sysctl net.core.rmem_max 16777216' hy2-manager && pass "conservative QUIC buffer attempt" || fail "conservative QUIC buffer attempt"
 grep -Fq 'if ! is_restricted_container' hy2-manager && grep -Fq 'restricted container blocks CLONE_NEWNS' hy2-manager && pass "restricted container systemd compatibility" || fail "restricted container systemd compatibility"
 grep -Fq 'NoNewPrivileges=true' hy2-manager && grep -Fq 'CapabilityBoundingSet=' hy2-manager && pass "service baseline hardening retained" || fail "service baseline hardening retained"
+grep -Fq "qrencode -t ANSIUTF8 || true" hy2-manager && pass "qrencode reads URI from stdin" || fail "qrencode reads URI from stdin"
+if grep -Fq 'qrencode -t ANSIUTF8 -r -' hy2-manager; then fail "no incompatible qrencode stdin filename"; else pass "no incompatible qrencode stdin filename"; fi
 
 if (( failures )); then printf '\n%d test(s) failed.\n' "$failures" >&2; exit 1; fi
 printf '\nAll tests passed.\n'
