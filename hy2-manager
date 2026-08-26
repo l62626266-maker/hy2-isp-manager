@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034
+set -Eeuo pipefail
+umask 077
+
+readonly APP_NAME="HY2 ISP Manager"
+readonly APP_VERSION="0.1.0-beta.1"
+readonly APP_DIR="${HY2M_APP_DIR:-/opt/hy2-isp-manager}"
+readonly STATE_DIR="${HY2M_STATE_DIR:-/etc/hy2-isp-manager}"
+readonly NODE_DIR="$STATE_DIR/nodes"
+readonly EXPORT_DIR="${HY2M_EXPORT_DIR:-/root/hy2-export}"
+readonly HYSTERIA_DIR="${HY2M_HYSTERIA_DIR:-/etc/hysteria-hy2m}"
+readonly TLS_DIR="$HYSTERIA_DIR/tls"
+readonly BACKUP_DIR="${HY2M_BACKUP_DIR:-/root/hy2-manager-backups}"
+readonly HYSTERIA_VERSION="${HY2M_HYSTERIA_VERSION:-v2.12.2}"
+readonly HYSTERIA_BIN="${HY2M_HYSTERIA_BIN:-$APP_DIR/bin/hysteria}"
+readonly MANAGER_STATE="$STATE_DIR/manager.env"
+readonly CF_CREDENTIALS="$STATE_DIR/cloudflare.ini"
+readonly SYSCTL_FILE="${HY2M_SYSCTL_FILE:-/etc/sysctl.d/99-hy2-manager.conf}"
+readonly SWAP_FILE="${HY2M_SWAP_FILE:-/swapfile-hy2m}"
+readonly FIREWALL_STATE="$STATE_DIR/firewall.rules"
+
+C_RESET='\033[0m'; C_BLUE='\033[1;34m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[1;31m'
+# Values loaded from root-owned state files. Declarations also document the state schema.
+# shellcheck disable=SC2034
+DOMAIN=""; PUBLIC_IP=""; NETWORK_MODE=""; CERT_MODE=""
+# shellcheck disable=SC2034
+ID=""; TYPE=""; NAME=""; LISTEN_PORT=""; PUBLIC_PORT=""; SERVICE=""; CONFIG=""; URI_FILE=""; SOCKS_EXIT_IP=""; SOCKS_UDP=""
+SOCKS_HOST=""; SOCKS_PORT=""; SOCKS_USER=""; SOCKS_PASS=""
+log() { printf "${C_BLUE}[信息]${C_RESET} %s\n" "$*"; }
+ok() { printf "${C_GREEN}[成功]${C_RESET} %s\n" "$*"; }
+warn() { printf "${C_YELLOW}[注意]${C_RESET} %s\n" "$*" >&2; }
+die() { printf "${C_RED}[错误]${C_RESET} %s\n" "$*" >&2; exit 1; }
+
+cleanup_files=()
+cleanup() { local f; for f in "${cleanup_files[@]:-}"; do [[ -z "$f" ]] || rm -f -- "$f"; done; }
+trap cleanup EXIT
+
+require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo hy2-manager"; }
+require_systemd() { if ! command -v systemctl >/dev/null || [[ ! -d /run/systemd/system ]]; then die "需要正在运行的 systemd。"; fi; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
+
+valid_port() { [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_domain() { [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+valid_ipv4() { local IFS=. p n=0; read -r -a p <<<"$1"; ((${#p[@]} == 4)) || return 1; for n in "${p[@]}"; do [[ $n =~ ^[0-9]{1,3}$ ]] && ((10#$n <= 255)) || return 1; done; }
+valid_host() { [[ -n $1 && $1 != *[[:space:]/]* ]]; }
+valid_name() { [[ $1 =~ ^[A-Za-z0-9._-]{1,48}$ ]]; }
+host_port() { if [[ $1 == *:* && $1 != \[*\] ]]; then printf '[%s]:%s' "$1" "$2"; else printf '%s:%s' "$1" "$2"; fi; }
+yaml_quote() { local v=$1; v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//$'\t'/\\t}; printf '"%s"' "$v"; }
+uri_encode() { python3 - "$1" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=''))
+PY
+}
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+has_whiptail() { is_tty && command -v whiptail >/dev/null 2>&1; }
+ask() {
+  local title=$1 prompt=$2 default=${3:-} out
+  if has_whiptail; then
+    out=$(whiptail --title "$title" --inputbox "$prompt" 10 72 "$default" 3>&1 1>&2 2>&3) || return 1
+  else
+    read -r -p "$prompt${default:+ [$default]}: " out
+    [[ -n $out ]] || out=$default
+  fi
+  printf '%s' "$out"
+}
+ask_secret() {
+  local title=$1 prompt=$2 out
+  if has_whiptail; then
+    out=$(whiptail --title "$title" --passwordbox "$prompt" 10 72 3>&1 1>&2 2>&3) || return 1
+  else
+    read -r -s -p "$prompt: " out; printf '\n' >&2
+  fi
+  printf '%s' "$out"
+}
+confirm() {
+  local prompt=$1
+  if has_whiptail; then whiptail --title "$APP_NAME" --yesno "$prompt" 12 76; return; fi
+  local ans; read -r -p "$prompt [y/N]: " ans; [[ $ans =~ ^[Yy]$ ]]
+}
+choose() {
+  local title=$1 prompt=$2; shift 2
+  if has_whiptail; then whiptail --title "$title" --menu "$prompt" 20 78 12 "$@" 3>&1 1>&2 2>&3; return; fi
+  local args=("$@") i
+  printf '\n%s\n' "$prompt" >&2
+  for ((i=0; i<${#args[@]}; i+=2)); do printf '  %s) %s\n' "${args[i]}" "${args[i+1]}" >&2; done
+  local choice; read -r -p "请选择: " choice; printf '%s' "$choice"
+}
+
+write_env() {
+  local path=$1; shift; local tmp key value
+  tmp=$(mktemp); cleanup_files+=("$tmp")
+  while (( $# >= 2 )); do key=$1; value=$2; shift 2; printf '%s=%q\n' "$key" "$value" >>"$tmp"; done
+  if [[ ${HY2M_TESTING:-0} == 1 ]]; then install -m 600 "$tmp" "$path"; else install -o root -g root -m 600 "$tmp" "$path"; fi
+}
+load_manager() { [[ -r $MANAGER_STATE ]] || die "尚未安装节点，请先运行安装。"; # shellcheck disable=SC1090
+  source "$MANAGER_STATE"; }
+load_node() { local f="$NODE_DIR/$1.env"; [[ -r $f ]] || die "节点不存在：$1"; # shellcheck disable=SC1090
+  source "$f"; }
+
+os_check() {
+  [[ -r /etc/os-release ]] || die "无法识别操作系统。"
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  case "${ID:-}:${VERSION_ID:-}" in
+    debian:12|debian:13|ubuntu:22.04|ubuntu:24.04) ;;
+    *) die "支持 Debian 12/13、Ubuntu 22.04/24.04；当前是 ${PRETTY_NAME:-unknown}。" ;;
+  esac
+  case "$(uname -m)" in x86_64|aarch64|arm64) ;; *) die "不支持的架构：$(uname -m)" ;; esac
+}
+
+install_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends bash ca-certificates certbot curl dnsutils iproute2 jq openssl python3 qrencode whiptail
+}
+
+install_hysteria() {
+  local installed arch asset base hashes binary expected actual
+  if [[ -x $HYSTERIA_BIN ]]; then
+    installed=$($HYSTERIA_BIN version 2>/dev/null | awk -F'\t' '/Version:/{print $2; exit}')
+    if [[ $installed == "$HYSTERIA_VERSION" ]]; then log "Hysteria $installed 已安装且版本正确。"; return; fi
+  fi
+  case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) die "不支持的架构。" ;; esac
+  asset="hysteria-linux-$arch"; base="https://github.com/apernet/hysteria/releases/download/app/$HYSTERIA_VERSION"
+  hashes=$(mktemp); binary=$(mktemp); cleanup_files+=("$hashes" "$binary")
+  log "下载并校验 Hysteria $HYSTERIA_VERSION ($arch)……"
+  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$base/hashes.txt" -o "$hashes"
+  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$base/$asset" -o "$binary"
+  expected=$(awk -v n="build/$asset" '$2==n{print $1; exit}' "$hashes")
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] || die "官方 hashes.txt 中找不到 $asset。"
+  actual=$(sha256sum "$binary"); actual=${actual%% *}; [[ $actual == "$expected" ]] || die "Hysteria SHA256 校验失败。"
+  install -d -o root -g root -m 755 "$(dirname "$HYSTERIA_BIN")"
+  install -o root -g root -m 755 "$binary" "$HYSTERIA_BIN"
+  ok "Hysteria 已通过官方 SHA256 校验。"
+}
+
+ensure_layout() {
+  id hysteria >/dev/null 2>&1 || useradd --system --home-dir /var/lib/hysteria --create-home --shell /usr/sbin/nologin hysteria
+  install -d -o root -g root -m 700 "$STATE_DIR" "$NODE_DIR" "$EXPORT_DIR" "$BACKUP_DIR"
+  install -d -o root -g hysteria -m 750 "$HYSTERIA_DIR" "$TLS_DIR"
+  install -d -o hysteria -g hysteria -m 750 /var/lib/hysteria
+}
+
+make_backup() {
+  local stamp target items=()
+  stamp=$(date +%Y%m%d-%H%M%S); target="$BACKUP_DIR/hy2m-$stamp.tar.gz"
+  mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+  for p in "$STATE_DIR" "$HYSTERIA_DIR" /etc/systemd/system/hy2m-direct.service /etc/systemd/system/hy2m-isp*.service; do [[ ! -e $p ]] || items+=("${p#/}"); done
+  if ((${#items[@]})); then (cd / && tar -czf "$target" "${items[@]}"); chmod 600 "$target"; ok "备份：$target"; fi
+}
+
+public_port_free() {
+  local port=$1 f
+  shopt -s nullglob
+  for f in "$NODE_DIR"/*.env; do grep -Fxq "PUBLIC_PORT=$port" "$f" && return 1; done
+  return 0
+}
+port_free() {
+  local port=$1 proto=$2
+  if [[ $proto == udp ]]; then
+    if ss -lunH | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then return 1; fi
+  else
+    if ss -ltnH | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then return 1; fi
+  fi
+  return 0
+}
+open_firewall() {
+  local port=$1 proto=$2 rule
+  rule="$port/$proto"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ufw status | awk '{print $1}' | grep -Fxq "$rule"; then return; fi
+    ufw allow "$rule" >/dev/null
+    printf '%s\n' "$rule" >>"$FIREWALL_STATE"; chmod 600 "$FIREWALL_STATE"
+  fi
+}
+close_firewall() {
+  local port=$1 proto=$2 rule tmp
+  rule="$port/$proto"
+  [[ -r $FIREWALL_STATE ]] && grep -Fxq "$rule" "$FIREWALL_STATE" || return 0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw --force delete allow "$rule" >/dev/null 2>&1 || true; fi
+  tmp=$(mktemp); cleanup_files+=("$tmp"); grep -Fxv "$rule" "$FIREWALL_STATE" >"$tmp" || true; install -o root -g root -m 600 "$tmp" "$FIREWALL_STATE"
+}
+
+configure_network() {
+  local mem_kb swap_mb=0
+  mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  cat >"$SYSCTL_FILE" <<'EOF'
+# Managed by HY2 ISP Manager. Conservative QUIC buffers; no custom kernel.
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+  sysctl --system >/dev/null
+  if (( mem_kb < 1500000 )) && ! swapon --show=NAME --noheadings | grep -q .; then
+    (( mem_kb < 750000 )) && swap_mb=768 || swap_mb=512
+    if [[ ! -f $SWAP_FILE ]]; then
+      fallocate -l "${swap_mb}M" "$SWAP_FILE" || dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$swap_mb" status=none
+      chmod 600 "$SWAP_FILE"; mkswap "$SWAP_FILE" >/dev/null
+    fi
+    swapon "$SWAP_FILE"
+    grep -qF "$SWAP_FILE none swap sw 0 0" /etc/fstab || printf '%s none swap sw 0 0\n' "$SWAP_FILE" >>/etc/fstab
+  fi
+}
+
+get_public_ipv4() { curl -4fsS --max-time 15 https://api.ipify.org; }
+check_dns() {
+  local domain=$1 expected=$2 resolved
+  resolved=$(dig +short A "$domain" | sort -u)
+  [[ -n $resolved ]] || die "域名 $domain 没有 A 记录。"
+  grep -Fxq "$expected" <<<"$resolved" || die "域名解析不匹配。期望 $expected，实际：$resolved"
+}
+
+certificate_http() {
+  local domain=$1 email=$2
+  port_free 80 tcp || die "内部 TCP 80 被占用，无法使用 HTTP-01。"
+  open_firewall 80 tcp
+  local args=(certonly --standalone --preferred-challenges http --non-interactive --agree-tos -d "$domain")
+  [[ -n $email ]] && args+=(--email "$email") || args+=(--register-unsafely-without-email)
+  certbot "${args[@]}"
+}
+certificate_valid() {
+  local domain=$1 live="/etc/letsencrypt/live/$1/fullchain.pem"
+  [[ -r $live ]] && openssl x509 -in "$live" -noout -checkend 2592000 >/dev/null 2>&1 && openssl x509 -in "$live" -noout -ext subjectAltName 2>/dev/null | grep -Fq "DNS:$domain"
+}
+certificate_cloudflare() {
+  local domain=$1 email=$2 token=$3
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y --no-install-recommends python3-certbot-dns-cloudflare
+  printf 'dns_cloudflare_api_token = %s\n' "$token" >"$CF_CREDENTIALS"; chmod 600 "$CF_CREDENTIALS"
+  local args=(certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CREDENTIALS" --dns-cloudflare-propagation-seconds 30 --non-interactive --agree-tos -d "$domain")
+  [[ -n $email ]] && args+=(--email "$email") || args+=(--register-unsafely-without-email)
+  certbot "${args[@]}"
+}
+copy_certificate() {
+  local domain=$1 live
+  live="/etc/letsencrypt/live/$domain"
+  [[ -r $live/fullchain.pem && -r $live/privkey.pem ]] || die "找不到证书：$live"
+  install -o root -g hysteria -m 640 "$live/fullchain.pem" "$TLS_DIR/fullchain.pem"
+  install -o root -g hysteria -m 640 "$live/privkey.pem" "$TLS_DIR/privkey.pem"
+  install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
+  cat >/etc/letsencrypt/renewal-hooks/deploy/hy2-manager-copy.sh <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+case " \${RENEWED_DOMAINS:-} " in *" $domain "*) ;; *) exit 0 ;; esac
+install -o root -g hysteria -m 640 "\$RENEWED_LINEAGE/fullchain.pem" "$TLS_DIR/fullchain.pem"
+install -o root -g hysteria -m 640 "\$RENEWED_LINEAGE/privkey.pem" "$TLS_DIR/privkey.pem"
+EOF
+  chmod 750 /etc/letsencrypt/renewal-hooks/deploy/hy2-manager-copy.sh
+  systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+}
+
+write_service() {
+  local service=$1 description=$2 config=$3
+  cat >"/etc/systemd/system/$service" <<EOF
+[Unit]
+Description=$description
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=hysteria
+Group=hysteria
+WorkingDirectory=/var/lib/hysteria
+Environment=HYSTERIA_LOG_LEVEL=info
+ExecStart=$HYSTERIA_BIN server -c $config
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=$HYSTERIA_DIR
+ReadWritePaths=/var/lib/hysteria
+Nice=-5
+LimitNOFILE=1048576
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_common_config() {
+  local port=$1 auth=$2
+  cat <<EOF
+listen: :$port
+
+tls:
+  cert: "$TLS_DIR/fullchain.pem"
+  key: "$TLS_DIR/privkey.pem"
+  sniGuard: strict
+
+auth:
+  type: password
+  password: $(yaml_quote "$auth")
+
+congestion:
+  type: bbr
+  bbrProfile: aggressive
+
+quic:
+  initStreamReceiveWindow: 26843545
+  maxStreamReceiveWindow: 26843545
+  initConnReceiveWindow: 67108864
+  maxConnReceiveWindow: 67108864
+
+speedTest: true
+
+masquerade:
+  type: string
+  string:
+    content: Welcome
+    headers:
+      content-type: text/plain
+    statusCode: 200
+EOF
+}
+
+start_checked() {
+  local service=$1 port=$2
+  systemctl daemon-reload; systemctl enable "$service" >/dev/null; systemctl restart "$service"
+  local i; for i in $(seq 1 20); do
+    if systemctl is-active --quiet "$service" && ss -lunH | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then return 0; fi
+    sleep 1
+  done
+  journalctl -u "$service" -n 40 --no-pager >&2 || true; return 1
+}
+
+save_node() {
+  local id=$1 type=$2 name=$3 listen_port=$4 public_port=$5 service=$6 config=$7 uri_file=$8 mode=$9
+  write_env "$NODE_DIR/$id.env" ID "$id" TYPE "$type" NAME "$name" LISTEN_PORT "$listen_port" PUBLIC_PORT "$public_port" SERVICE "$service" CONFIG "$config" URI_FILE "$uri_file" NETWORK_MODE "$mode"
+}
+
+create_direct() {
+  load_manager
+  [[ ! -e $NODE_DIR/direct.env ]] || die "直连节点已经存在。"
+  local listen_port public_port mode auth config service uri_file tmp
+  mode=$NETWORK_MODE
+  listen_port=$(ask "直连节点" "VPS 内部 UDP 监听端口" "443") || return
+  valid_port "$listen_port" || die "内部端口无效。"; port_free "$listen_port" udp || die "UDP $listen_port 已占用。"
+  if [[ $mode == nat ]]; then public_port=$(ask "NAT 映射" "服务商控制台的公网 UDP 端口" "") || return; else public_port=$listen_port; fi
+  valid_port "$public_port" || die "公网端口无效。"; public_port_free "$public_port" || die "公网端口 $public_port 已被其他节点记录。"
+  auth=$(openssl rand -hex 24); config="$HYSTERIA_DIR/direct.yaml"; service=hy2m-direct.service; uri_file="$EXPORT_DIR/hy2-direct.txt"
+  tmp=$(mktemp); cleanup_files+=("$tmp"); write_common_config "$listen_port" "$auth" >"$tmp"
+  install -o root -g hysteria -m 640 "$tmp" "$config"
+  printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0#HY2-Direct\n' "$auth" "$DOMAIN" "$public_port" "$DOMAIN" >"$uri_file"; chmod 600 "$uri_file"
+  write_service "$service" "HY2 Manager Direct Node" "$config"; open_firewall "$listen_port" udp
+  if ! start_checked "$service" "$listen_port"; then systemctl disable --now "$service" >/dev/null 2>&1 || true; rm -f "$config" "/etc/systemd/system/$service" "$uri_file"; die "直连节点启动失败，已回滚。"; fi
+  save_node direct direct HY2-Direct "$listen_port" "$public_port" "$service" "$config" "$uri_file" "$mode"
+  if [[ $mode == nat ]]; then warn "请确认服务商控制台已有：公网 UDP $public_port → 内部 UDP $listen_port"; fi
+  ok "直连节点已创建。"
+}
+
+read_socks() {
+  SOCKS_HOST=$(ask "ISP SOCKS5" "SOCKS5 地址（IP 或域名）" "") || return
+  SOCKS_PORT=$(ask "ISP SOCKS5" "SOCKS5 端口" "") || return
+  SOCKS_USER=$(ask "ISP SOCKS5" "用户名" "") || return
+  SOCKS_PASS=$(ask_secret "ISP SOCKS5" "密码（输入时不显示）") || return
+  valid_host "$SOCKS_HOST" || die "SOCKS5 地址无效。"; valid_port "$SOCKS_PORT" || die "SOCKS5 端口无效。"
+  [[ -n $SOCKS_USER && $SOCKS_USER != *:* && -n $SOCKS_PASS ]] || die "SOCKS5 用户名或密码无效。"
+}
+probe_socks_udp() {
+  python3 - "$SOCKS_HOST" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS" <<'PY'
+import socket, struct, sys
+h,p,u,w=sys.argv[1],int(sys.argv[2]),sys.argv[3].encode(),sys.argv[4].encode()
+def rx(s,n):
+ d=b''
+ while len(d)<n:
+  c=s.recv(n-len(d))
+  if not c: raise OSError('EOF')
+  d+=c
+ return d
+try:
+ with socket.create_connection((h,p),8) as s:
+  s.sendall(b'\x05\x01\x02'); v,m=rx(s,2)
+  if (v,m)!=(5,2): print('unsupported'); raise SystemExit
+  s.sendall(b'\x01'+bytes([len(u)])+u+bytes([len(w)])+w)
+  if rx(s,2)[1]!=0: print('auth_failed'); raise SystemExit
+  s.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00'); r=rx(s,4)
+  print('supported' if r[:2]==b'\x05\x00' else 'unsupported')
+except Exception: print('probe_failed')
+PY
+}
+verify_socks() {
+  local cfg exit_ip
+  cfg=$(mktemp); cleanup_files+=("$cfg")
+  printf 'socks5-hostname = %s\nproxy-user = %s\n' "$(yaml_quote "$(host_port "$SOCKS_HOST" "$SOCKS_PORT")")" "$(yaml_quote "$SOCKS_USER:$SOCKS_PASS")" >"$cfg"; chmod 600 "$cfg"
+  exit_ip=$(curl --config "$cfg" -4fsS --max-time 20 https://api.ipify.org) || die "SOCKS5 TCP 或认证测试失败。"
+  SOCKS_EXIT_IP=$exit_ip; SOCKS_UDP=$(probe_socks_udp)
+  [[ $SOCKS_UDP != auth_failed ]] || die "SOCKS5 UDP 探测认证失败。"
+  ok "SOCKS5 出口：$SOCKS_EXIT_IP；UDP：$SOCKS_UDP"
+}
+
+render_isp_config() {
+  local port=$1 auth=$2 outbound=$3
+  write_common_config "$port" "$auth"
+  printf '\noutbounds:\n  - name: %s\n    type: socks5\n    socks5:\n      addr: %s\n      username: %s\n      password: %s\n\n' "$outbound" "$(yaml_quote "$(host_port "$SOCKS_HOST" "$SOCKS_PORT")")" "$(yaml_quote "$SOCKS_USER")" "$(yaml_quote "$SOCKS_PASS")"
+  printf 'acl:\n  inline:\n    - %s(all)\n' "$outbound"
+}
+
+next_isp_slot() { local i; for i in $(seq 1 20); do [[ -e $NODE_DIR/isp$i.env ]] || { printf '%s' "$i"; return; }; done; die "ISP 节点已达到上限。"; }
+create_isp() {
+  load_manager; local index id name listen_default listen_port public_port mode auth config service uri_file tmp outbound
+  index=$(next_isp_slot); id="isp$index"; name="HY2-ISP-Full-$index"; [[ $index == 1 ]] && name=HY2-ISP-Full
+  mode=$NETWORK_MODE; listen_default=$((7443 + index * 1000))
+  listen_port=$(ask "ISP 全局节点" "VPS 内部 UDP 监听端口" "$listen_default") || return
+  valid_port "$listen_port" || die "内部端口无效。"; port_free "$listen_port" udp || die "UDP $listen_port 已占用。"
+  if [[ $mode == nat ]]; then public_port=$(ask "NAT 映射" "服务商控制台的公网 UDP 端口" "") || return; else public_port=$listen_port; fi
+  valid_port "$public_port" || die "公网端口无效。"; public_port_free "$public_port" || die "公网端口 $public_port 已被其他节点记录。"
+  name=$(ask "ISP 全局节点" "节点名称" "$name") || return; valid_name "$name" || die "节点名称只允许字母、数字、点、下划线和短横线。"
+  read_socks; verify_socks
+  auth=$(openssl rand -hex 24); config="$HYSTERIA_DIR/$id.yaml"; service="hy2m-$id.service"; uri_file="$EXPORT_DIR/hy2-$id.txt"; outbound="isp_all_$index"
+  tmp=$(mktemp); cleanup_files+=("$tmp")
+  render_isp_config "$listen_port" "$auth" "$outbound" >"$tmp"
+  install -o root -g hysteria -m 640 "$tmp" "$config"
+  printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0#%s\n' "$auth" "$DOMAIN" "$public_port" "$DOMAIN" "$name" >"$uri_file"; chmod 600 "$uri_file"
+  write_service "$service" "HY2 Manager ISP Full Node $index" "$config"; open_firewall "$listen_port" udp
+  if ! start_checked "$service" "$listen_port"; then systemctl disable --now "$service" >/dev/null 2>&1 || true; rm -f "$config" "/etc/systemd/system/$service" "$uri_file"; die "ISP 节点启动失败，已回滚。"; fi
+  save_node "$id" isp "$name" "$listen_port" "$public_port" "$service" "$config" "$uri_file" "$mode"
+  printf 'SOCKS_EXIT_IP=%q\nSOCKS_UDP=%q\n' "$SOCKS_EXIT_IP" "$SOCKS_UDP" >>"$NODE_DIR/$id.env"
+  if [[ $mode == nat ]]; then warn "请确认服务商控制台已有：公网 UDP $public_port → 内部 UDP $listen_port"; fi
+  [[ $SOCKS_UDP == supported ]] || warn "该 ISP SOCKS5 不支持 UDP；网页 TCP/HTTPS 通常可用，必须使用 UDP 的应用可能失败。"
+  ok "ISP 全局节点已创建；配置只定义 ISP outbound，不会故障回退到 VPS。"
+  unset SOCKS_PASS
+}
+
+replace_isp() {
+  load_manager
+  local id f old_name old_listen old_public old_service old_config old_uri old_mode auth outbound tmp backup
+  id=$(ask "更换 ISP" "节点 ID（例如 isp1）" "isp1") || return
+  [[ $id =~ ^isp[0-9]+$ ]] || die "只能更换 ISP 节点。"
+  f="$NODE_DIR/$id.env"; [[ -r $f ]] || die "节点不存在：$id"
+  # shellcheck disable=SC1090
+  source "$f"
+  old_name=$NAME; old_listen=$LISTEN_PORT; old_public=$PUBLIC_PORT; old_service=$SERVICE; old_config=$CONFIG; old_uri=$URI_FILE; old_mode=$NETWORK_MODE
+  auth=$(awk -F'"' '/^[[:space:]]*password:/{print $2; exit}' "$old_config")
+  [[ $auth =~ ^[0-9a-f]{48}$ ]] || die "无法安全读取现有 HY2 认证信息。"
+  read_socks; verify_socks
+  outbound="isp_all_${id#isp}"; tmp=$(mktemp); backup=$(mktemp); cleanup_files+=("$tmp" "$backup")
+  render_isp_config "$old_listen" "$auth" "$outbound" >"$tmp"; cp -a "$old_config" "$backup"
+  install -o root -g hysteria -m 640 "$tmp" "$old_config"
+  if ! systemctl restart "$old_service" || ! start_checked "$old_service" "$old_listen"; then
+    warn "新 ISP 配置启动失败，恢复旧配置。"; install -o root -g hysteria -m 640 "$backup" "$old_config"; systemctl restart "$old_service" || true; die "更换失败，旧配置已恢复。"
+  fi
+  save_node "$id" isp "$old_name" "$old_listen" "$old_public" "$old_service" "$old_config" "$old_uri" "$old_mode"
+  printf 'SOCKS_EXIT_IP=%q\nSOCKS_UDP=%q\n' "$SOCKS_EXIT_IP" "$SOCKS_UDP" >>"$f"
+  unset SOCKS_PASS
+  ok "$old_name 已更换 ISP；HY2 链接和密码保持不变。"
+}
+
+show_nodes() {
+  load_manager; local f uri
+  shopt -s nullglob
+  local files=("$NODE_DIR"/*.env); ((${#files[@]})) || die "没有节点。"
+  for f in "${files[@]}"; do
+    unset ID TYPE NAME LISTEN_PORT PUBLIC_PORT SERVICE URI_FILE SOCKS_EXIT_IP SOCKS_UDP
+    # shellcheck disable=SC1090
+    source "$f"
+    printf '\n%s\n  内部 UDP: %s  公网 UDP: %s  服务: %s\n' "$NAME" "$LISTEN_PORT" "$PUBLIC_PORT" "$SERVICE"
+    [[ -z ${SOCKS_EXIT_IP:-} ]] || printf '  ISP 出口: %s  SOCKS UDP: %s\n' "$SOCKS_EXIT_IP" "${SOCKS_UDP:-unknown}"
+    if confirm "显示 $NAME 的完整敏感导入链接和二维码？"; then
+      uri=$(<"$URI_FILE"); printf '%s\n' "$uri"
+      if command -v qrencode >/dev/null && is_tty; then printf '%s' "$uri" | qrencode -t ANSIUTF8 -r - || true; fi
+    fi
+  done
+}
+
+status_all() {
+  load_manager; printf '%s %s\n域名: %s\n网络类型: %s\n\n' "$APP_NAME" "$APP_VERSION" "$DOMAIN" "$NETWORK_MODE"
+  local f; shopt -s nullglob
+  for f in "$NODE_DIR"/*.env; do
+    unset NAME SERVICE LISTEN_PORT PUBLIC_PORT
+    # shellcheck disable=SC1090
+    source "$f"
+    printf '%-24s active=%-8s enabled=%-8s 内部/公网 UDP=%s/%s\n' "$NAME" "$(systemctl is-active "$SERVICE" 2>/dev/null || true)" "$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)" "$LISTEN_PORT" "$PUBLIC_PORT"
+  done
+}
+
+diagnose() {
+  load_manager; status_all
+  printf '\nTLS:\n'; openssl x509 -in "$TLS_DIR/fullchain.pem" -noout -subject -issuer -dates || true
+  printf '\n网络优化:\n'; sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max net.core.wmem_max 2>/dev/null || true; swapon --show || true
+  printf '\n监听:\n'; ss -lunp | grep hysteria || true
+  printf '\nDNS:\n'; dig +short A "$DOMAIN" || true
+  printf '\n注意：NAT 公网 UDP 映射必须从 VPS 外部用真实客户端验证，VPS 内部检查不能证明运营商映射可达。\n'
+}
+
+remove_node() {
+  load_manager; local id f
+  id=$(ask "删除节点" "节点 ID（例如 direct、isp1）" "") || return; f="$NODE_DIR/$id.env"; [[ -r $f ]] || die "节点不存在。"
+  unset SERVICE CONFIG URI_FILE LISTEN_PORT
+  # shellcheck disable=SC1090
+  source "$f"
+  confirm "确定删除 $id？不会删除 SSH。" || return
+  systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true; rm -f "/etc/systemd/system/$SERVICE" "$CONFIG" "$URI_FILE" "$f"; close_firewall "$LISTEN_PORT" udp; systemctl daemon-reload
+  ok "节点 $id 已删除。"
+}
+
+uninstall_all() {
+  [[ -r $MANAGER_STATE ]] || die "未检测到安装状态。"; confirm "完整卸载本管理器创建的节点？SSH 和其他服务不会被修改。" || return
+  make_backup; local f
+  shopt -s nullglob
+  for f in "$NODE_DIR"/*.env; do
+    unset SERVICE CONFIG URI_FILE LISTEN_PORT
+    # shellcheck disable=SC1090
+    source "$f"
+    systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true; rm -f "/etc/systemd/system/$SERVICE" "$CONFIG" "$URI_FILE"; close_firewall "$LISTEN_PORT" udp
+  done
+  if [[ -r $FIREWALL_STATE ]]; then while IFS=/ read -r port proto; do close_firewall "$port" "$proto"; done < <(cp "$FIREWALL_STATE" /dev/stdout); fi
+  systemctl daemon-reload; rm -rf "$STATE_DIR" "$HYSTERIA_DIR" "$EXPORT_DIR"; rm -f /etc/letsencrypt/renewal-hooks/deploy/hy2-manager-copy.sh
+  rm -f /usr/local/sbin/hy2-manager /usr/local/bin/hy2-manager; rm -rf "$APP_DIR"
+  ok "卸载完成。系统证书账户、网络优化和备份被保留，避免影响其他程序。"
+}
+
+initial_install() {
+  [[ ! -e $MANAGER_STATE ]] || die "已经安装，请使用管理菜单。"
+  os_check; require_systemd
+  log "安装依赖……"; install_packages; ensure_layout; install_hysteria
+  local mode domain public_ip cert_mode email token
+  mode=$(choose "网络类型" "请选择 VPS 类型" normal "普通公网 VPS" nat "NAT / 端口映射 VPS") || return
+  [[ $mode == normal || $mode == nat ]] || die "网络类型无效。"
+  domain=$(ask "域名" "HY2 域名（Cloudflare 必须灰云）" "") || return; valid_domain "$domain" || die "域名无效。"
+  if [[ $mode == normal ]]; then public_ip=$(get_public_ipv4); else public_ip=$(ask "NAT 公网 IP" "服务商控制台显示的绑定公网 IPv4" "") || return; fi
+  valid_ipv4 "$public_ip" || die "公网 IPv4 格式无效。"
+  check_dns "$domain" "$public_ip"
+  cert_mode=$(choose "证书" "请选择证书验证方式" http "HTTP-01（需要公网 80→内部80）" cloudflare "Cloudflare DNS-01（适合 NAT）") || return
+  email=$(ask "证书" "Let's Encrypt 邮箱（可以留空）" "") || return
+  make_backup; configure_network
+  if certificate_valid "$domain"; then
+    ok "检测到 30 天以上有效期的现有证书，将安全复用。"
+  elif [[ $cert_mode == http ]]; then
+    [[ $mode == normal ]] || confirm "NAT 模式必须确认公网 TCP 80 → 内部 TCP 80，是否继续？" || return
+    certificate_http "$domain" "$email"
+  elif [[ $cert_mode == cloudflare ]]; then
+    token=$(ask_secret "Cloudflare" "请输入仅含 Zone.DNS Edit 权限的 API Token") || return; [[ -n $token ]] || die "Token 不能为空。"
+    certificate_cloudflare "$domain" "$email" "$token"; unset token
+  else die "证书方式无效。"; fi
+  copy_certificate "$domain"
+  write_env "$MANAGER_STATE" APP_VERSION "$APP_VERSION" DOMAIN "$domain" PUBLIC_IP "$public_ip" NETWORK_MODE "$mode" CERT_MODE "$cert_mode"
+  log "创建 HY2 直连节点……"; create_direct
+  if confirm "现在添加 ISP SOCKS5 全局节点？"; then create_isp; fi
+  ok "安装完成。运行 hy2-manager 查看菜单。"
+}
+
+install_self() {
+  require_root; install -d -o root -g root -m 755 "$APP_DIR"; install -o root -g root -m 755 "$0" "$APP_DIR/hy2-manager"; ln -sfn "$APP_DIR/hy2-manager" /usr/local/sbin/hy2-manager; ln -sfn /usr/local/sbin/hy2-manager /usr/local/bin/hy2-manager
+  ok "管理器已安装：运行 sudo hy2-manager"
+}
+
+main_menu() {
+  local c
+  while true; do
+    c=$(choose "$APP_NAME $APP_VERSION" "请选择操作" 1 "全新安装" 2 "创建/补建 HY2 直连节点" 3 "添加 ISP SOCKS5 全局节点" 4 "更换现有 ISP SOCKS5" 5 "查看节点与二维码" 6 "查看状态" 7 "一键诊断" 8 "删除指定节点" 9 "备份当前配置" 10 "卸载" 0 "退出") || return
+    case $c in
+      1) initial_install ;; 2) create_direct ;; 3) create_isp ;; 4) replace_isp ;; 5) show_nodes ;; 6) status_all ;; 7) diagnose ;; 8) remove_node ;; 9) make_backup ;; 10) uninstall_all; return ;; 0) return ;; *) warn "无效选择。" ;;
+    esac
+    is_tty && { printf '\n按 Enter 返回菜单……'; read -r; }
+  done
+}
+
+usage() {
+  cat <<EOF
+$APP_NAME $APP_VERSION
+用法：
+  sudo bash hy2-manager install-self
+  sudo hy2-manager install
+  sudo hy2-manager create-direct
+  sudo hy2-manager add-isp
+  sudo hy2-manager replace-isp
+  sudo hy2-manager show
+  sudo hy2-manager status
+  sudo hy2-manager diagnose
+  sudo hy2-manager backup
+  sudo hy2-manager remove-node
+  sudo hy2-manager uninstall
+  sudo hy2-manager menu
+EOF
+}
+
+main() {
+  local cmd=${1:-menu}
+  case $cmd in -h|--help|help) usage; return ;; version|--version) printf '%s\n' "$APP_VERSION"; return ;; esac
+  require_root
+  case $cmd in
+    install-self) install_self ;; install) initial_install ;; create-direct) create_direct ;; add-isp) create_isp ;; replace-isp) replace_isp ;; show) show_nodes ;; status) status_all ;; diagnose) diagnose ;; backup) make_backup ;; remove-node) remove_node ;; uninstall) uninstall_all ;; menu) main_menu ;; *) usage; exit 2 ;;
+  esac
+}
+
+if [[ ${HY2M_SOURCE_ONLY:-0} != 1 ]]; then
+  main "$@"
+fi
