@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly APP_NAME="HY2 ISP Manager"
-readonly APP_VERSION="0.1.0-beta.3"
+readonly APP_VERSION="0.1.0-beta.4"
 readonly APP_DIR="${HY2M_APP_DIR:-/opt/hy2-isp-manager}"
 readonly STATE_DIR="${HY2M_STATE_DIR:-/etc/hy2-isp-manager}"
 readonly NODE_DIR="$STATE_DIR/nodes"
@@ -94,8 +94,12 @@ write_env() {
   while (( $# >= 2 )); do key=$1; value=$2; shift 2; printf '%s=%q\n' "$key" "$value" >>"$tmp"; done
   if [[ ${HY2M_TESTING:-0} == 1 ]]; then install -m 600 "$tmp" "$path"; else install -o root -g root -m 600 "$tmp" "$path"; fi
 }
-load_manager() { [[ -r $MANAGER_STATE ]] || die "尚未安装节点，请先运行安装。"; # shellcheck disable=SC1090
-  source "$MANAGER_STATE"; }
+load_manager() { [[ -r $MANAGER_STATE ]] || die "尚未安装节点，请先运行安装。"
+  # beta.3 and older wrote APP_VERSION into manager.env. Ignore that legacy
+  # field so it cannot overwrite the manager's readonly runtime version.
+  # shellcheck disable=SC1090
+  source <(grep -v '^APP_VERSION=' "$MANAGER_STATE" || true)
+}
 load_node() { local f="$NODE_DIR/$1.env"; [[ -r $f ]] || die "节点不存在：$1"; # shellcheck disable=SC1090
   source "$f"; }
 
@@ -565,7 +569,7 @@ initial_install() {
     certificate_cloudflare "$domain" "$email" "$token"; unset token
   else die "证书方式无效。"; fi
   copy_certificate "$domain"
-  write_env "$MANAGER_STATE" APP_VERSION "$APP_VERSION" DOMAIN "$domain" PUBLIC_IP "$public_ip" NETWORK_MODE "$mode" CERT_MODE "$cert_mode"
+  write_env "$MANAGER_STATE" INSTALLED_VERSION "$APP_VERSION" DOMAIN "$domain" PUBLIC_IP "$public_ip" NETWORK_MODE "$mode" CERT_MODE "$cert_mode"
   log "创建 HY2 直连节点……"; create_direct
   if confirm "现在添加 ISP SOCKS5 全局节点？"; then create_isp; fi
   ok "安装完成。运行 hy2-manager 查看菜单。"

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.0-beta.4
+
+- 修复旧状态文件中的 `APP_VERSION` 与管理器只读版本变量冲突。
+- 新状态改用 `INSTALLED_VERSION`，并兼容 beta.3 及更早状态，无需重装证书或节点。
+
 ## v0.1.0-beta.3
 
 - 自动识别 LXC/LXD/OpenVZ 等受限容器，跳过宿主机控制的内核调优和 Swap。
