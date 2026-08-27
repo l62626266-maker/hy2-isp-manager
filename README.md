@@ -8,7 +8,7 @@
 - Let’s Encrypt HTTP-01 与 Cloudflare DNS-01；
 - v2rayN URI、终端二维码、状态、诊断、备份和安全卸载。
 
-> 当前稳定版本：`v0.1.1`。已通过 Bash 语法、ShellCheck、契约测试及一次性 LXD NAT VPS 的证书、服务启动、状态和 UDP 监听验证。不同服务商的 NAT 映射与 ISP SOCKS5 仍应在部署后执行外部客户端验证。
+> 当前稳定版本：`v0.1.1`；交互改进测试版：`v0.2.0-beta.1`。测试版增加输入原地重试、菜单错误隔离和非敏感安装断点。ISP SOCKS5 仍需使用有效服务实机验证。
 
 ## 支持环境
 
@@ -23,7 +23,7 @@
 固定版本发布后：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/v0.1.1/install.sh -o /tmp/hy2-install.sh
+curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/v0.2.0-beta.1/install.sh -o /tmp/hy2-install.sh
 bash -n /tmp/hy2-install.sh
 sudo bash /tmp/hy2-install.sh
 ```
@@ -42,6 +42,15 @@ sudo bash install.sh
 ```bash
 sudo hy2-manager
 ```
+
+## 交互与失败恢复
+
+- 端口、域名、IPv4、节点名称和 SOCKS5 字段格式错误会在当前字段重新询问；
+- 端口占用或节点 ID 不存在时不会退出管理器；
+- SOCKS5 测试失败可直接重新输入凭据；
+- 文本终端输入 `:menu` 可取消当前操作并回到主菜单；
+- 菜单动作在隔离子进程运行，深层错误不会把整个菜单退出到 root shell；
+- 全新安装会以 root-only 断点文件保存域名、模式、公网 IP、证书方式和邮箱等非敏感进度；断点文件不保存 Cloudflare Token 或 SOCKS5 密码。DNS-01 成功续期仍需使用单独的 root-only Cloudflare 凭据文件。
 
 ## 傻瓜式菜单
 

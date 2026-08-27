@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly APP_NAME="HY2 ISP Manager"
-readonly APP_VERSION="0.1.1"
+readonly APP_VERSION="0.2.0-beta.1"
 readonly APP_DIR="${HY2M_APP_DIR:-/opt/hy2-isp-manager}"
 readonly STATE_DIR="${HY2M_STATE_DIR:-/etc/hy2-isp-manager}"
 readonly NODE_DIR="$STATE_DIR/nodes"
@@ -19,6 +19,7 @@ readonly CF_CREDENTIALS="$STATE_DIR/cloudflare.ini"
 readonly SYSCTL_FILE="${HY2M_SYSCTL_FILE:-/etc/sysctl.d/99-hy2-manager.conf}"
 readonly SWAP_FILE="${HY2M_SWAP_FILE:-/swapfile-hy2m}"
 readonly FIREWALL_STATE="$STATE_DIR/firewall.rules"
+readonly INSTALL_SESSION="$STATE_DIR/install-session.env"
 
 C_RESET='\033[0m'; C_BLUE='\033[1;34m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[1;31m'
 # Values loaded from root-owned state files. Declarations also document the state schema.
@@ -63,8 +64,22 @@ ask() {
     read -r -p "$prompt${default:+ [$default]}: " out
     [[ -n $out ]] || out=$default
   fi
+  if [[ $out == :menu ]]; then warn "已取消当前操作，返回主菜单。"; return 20; fi
   printf '%s' "$out"
 }
+ask_valid() {
+  local title=$1 prompt=$2 default=$3 validator=$4 error_text=$5 out
+  while true; do
+    out=$(ask "$title" "$prompt" "$default") || return $?
+    if "$validator" "$out"; then printf '%s' "$out"; return 0; fi
+    warn "$error_text 请重新输入，或输入 :menu 返回主菜单。"
+  done
+}
+ask_valid_port() { ask_valid "$1" "$2" "$3" valid_port "端口必须是 1-65535 的整数。"; }
+ask_valid_domain() { ask_valid "$1" "$2" "$3" valid_domain "域名格式无效。"; }
+ask_valid_ipv4() { ask_valid "$1" "$2" "$3" valid_ipv4 "IPv4 格式无效。"; }
+ask_valid_host() { ask_valid "$1" "$2" "$3" valid_host "地址格式无效。"; }
+ask_valid_name() { ask_valid "$1" "$2" "$3" valid_name "名称只允许字母、数字、点、下划线和短横线，最长 48 个字符。"; }
 ask_secret() {
   local title=$1 prompt=$2 out
   if has_whiptail; then
@@ -73,6 +88,15 @@ ask_secret() {
     read -r -s -p "$prompt: " out; printf '\n' >&2
   fi
   printf '%s' "$out"
+}
+run_menu_action() {
+  local rc
+  set +e
+  ( set -Eeuo pipefail; "$@" )
+  rc=$?
+  set -e
+  if ((rc != 0)); then warn "当前操作未完成（错误码 $rc），已安全返回主菜单。"; fi
+  return 0
 }
 confirm() {
   local prompt=$1
@@ -230,17 +254,17 @@ get_public_ipv4() { curl -4fsS --max-time 15 https://api.ipify.org; }
 check_dns() {
   local domain=$1 expected=$2 resolved
   resolved=$(dig +short A "$domain" | sort -u)
-  [[ -n $resolved ]] || die "域名 $domain 没有 A 记录。"
-  grep -Fxq "$expected" <<<"$resolved" || die "域名解析不匹配。期望 $expected，实际：$resolved"
+  if [[ -z $resolved ]]; then warn "域名 $domain 没有 A 记录。"; return 1; fi
+  if ! grep -Fxq "$expected" <<<"$resolved"; then warn "域名解析不匹配。期望 $expected，实际：$resolved"; return 1; fi
 }
 
 certificate_http() {
   local domain=$1 email=$2
-  port_free 80 tcp || die "内部 TCP 80 被占用，无法使用 HTTP-01。"
+  if ! port_free 80 tcp; then warn "内部 TCP 80 被占用，无法使用 HTTP-01。"; return 1; fi
   open_firewall 80 tcp
   local args=(certonly --standalone --preferred-challenges http --non-interactive --agree-tos -d "$domain")
   [[ -n $email ]] && args+=(--email "$email") || args+=(--register-unsafely-without-email)
-  certbot "${args[@]}"
+  certbot "${args[@]}" || { warn "HTTP-01 证书签发失败。"; return 1; }
 }
 certificate_valid() {
   local domain=$1 live="/etc/letsencrypt/live/$1/fullchain.pem"
@@ -249,11 +273,11 @@ certificate_valid() {
 certificate_cloudflare() {
   local domain=$1 email=$2 token=$3
   export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y --no-install-recommends python3-certbot-dns-cloudflare
+  apt-get install -y --no-install-recommends python3-certbot-dns-cloudflare || { warn "Cloudflare DNS 插件安装失败。"; return 1; }
   printf 'dns_cloudflare_api_token = %s\n' "$token" >"$CF_CREDENTIALS"; chmod 600 "$CF_CREDENTIALS"
   local args=(certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CREDENTIALS" --dns-cloudflare-propagation-seconds 30 --non-interactive --agree-tos -d "$domain")
   [[ -n $email ]] && args+=(--email "$email") || args+=(--register-unsafely-without-email)
-  certbot "${args[@]}"
+  certbot "${args[@]}" || { warn "Cloudflare DNS-01 证书签发失败，请检查 Token、Zone 权限和 DNS。"; return 1; }
 }
 copy_certificate() {
   local domain=$1 live
@@ -372,10 +396,18 @@ create_direct() {
   [[ ! -e $NODE_DIR/direct.env ]] || die "直连节点已经存在。"
   local listen_port public_port mode auth config service uri_file tmp
   mode=$NETWORK_MODE
-  listen_port=$(ask "直连节点" "VPS 内部 UDP 监听端口" "443") || return
-  valid_port "$listen_port" || die "内部端口无效。"; port_free "$listen_port" udp || die "UDP $listen_port 已占用。"
-  if [[ $mode == nat ]]; then public_port=$(ask "NAT 映射" "服务商控制台的公网 UDP 端口" "") || return; else public_port=$listen_port; fi
-  valid_port "$public_port" || die "公网端口无效。"; public_port_free "$public_port" || die "公网端口 $public_port 已被其他节点记录。"
+  while true; do
+    listen_port=$(ask_valid_port "直连节点" "VPS 内部 UDP 监听端口" "443") || return $?
+    if port_free "$listen_port" udp; then break; fi
+    warn "UDP $listen_port 已占用，请重新输入。"
+  done
+  if [[ $mode == nat ]]; then
+    while true; do
+      public_port=$(ask_valid_port "NAT 映射" "服务商控制台的公网 UDP 端口" "") || return $?
+      if public_port_free "$public_port"; then break; fi
+      warn "公网端口 $public_port 已被其他节点记录，请重新输入。"
+    done
+  else public_port=$listen_port; fi
   auth=$(openssl rand -hex 24); config="$HYSTERIA_DIR/direct.yaml"; service=hy2m-direct.service; uri_file="$EXPORT_DIR/hy2-direct.txt"
   tmp=$(mktemp); cleanup_files+=("$tmp"); write_common_config "$listen_port" "$auth" >"$tmp"
   install -o root -g hysteria -m 640 "$tmp" "$config"
@@ -388,12 +420,18 @@ create_direct() {
 }
 
 read_socks() {
-  SOCKS_HOST=$(ask "ISP SOCKS5" "SOCKS5 地址（IP 或域名）" "") || return
-  SOCKS_PORT=$(ask "ISP SOCKS5" "SOCKS5 端口" "") || return
-  SOCKS_USER=$(ask "ISP SOCKS5" "用户名" "") || return
-  SOCKS_PASS=$(ask_secret "ISP SOCKS5" "密码（输入时不显示）") || return
-  valid_host "$SOCKS_HOST" || die "SOCKS5 地址无效。"; valid_port "$SOCKS_PORT" || die "SOCKS5 端口无效。"
-  [[ -n $SOCKS_USER && $SOCKS_USER != *:* && -n $SOCKS_PASS ]] || die "SOCKS5 用户名或密码无效。"
+  SOCKS_HOST=$(ask_valid_host "ISP SOCKS5" "SOCKS5 地址（IP 或域名）" "") || return $?
+  SOCKS_PORT=$(ask_valid_port "ISP SOCKS5" "SOCKS5 端口" "") || return $?
+  while true; do
+    SOCKS_USER=$(ask "ISP SOCKS5" "用户名" "") || return $?
+    if [[ -n $SOCKS_USER && $SOCKS_USER != *:* ]]; then break; fi
+    warn "用户名不能为空且不能包含冒号，请重新输入。"
+  done
+  while true; do
+    SOCKS_PASS=$(ask_secret "ISP SOCKS5" "密码（输入时不显示）") || return $?
+    [[ -n $SOCKS_PASS ]] && break
+    warn "密码不能为空，请重新输入。"
+  done
 }
 probe_socks_udp() {
   local cred
@@ -426,9 +464,11 @@ verify_socks() {
   local cfg exit_ip
   cfg=$(mktemp); cleanup_files+=("$cfg")
   printf 'socks5-hostname = %s\nproxy-user = %s\n' "$(yaml_quote "$(host_port "$SOCKS_HOST" "$SOCKS_PORT")")" "$(yaml_quote "$SOCKS_USER:$SOCKS_PASS")" >"$cfg"; chmod 600 "$cfg"
-  exit_ip=$(curl --config "$cfg" -4fsS --max-time 20 https://api.ipify.org) || die "SOCKS5 TCP 或认证测试失败。"
+  if ! exit_ip=$(curl --config "$cfg" -4fsS --max-time 20 https://api.ipify.org); then
+    warn "SOCKS5 TCP、认证或上游出口测试失败。"; return 1
+  fi
   SOCKS_EXIT_IP=$exit_ip; SOCKS_UDP=$(probe_socks_udp)
-  [[ $SOCKS_UDP != auth_failed ]] || die "SOCKS5 UDP 探测认证失败。"
+  if [[ $SOCKS_UDP == auth_failed ]]; then warn "SOCKS5 UDP 探测认证失败。"; return 1; fi
   ok "SOCKS5 出口：$SOCKS_EXIT_IP；UDP：$SOCKS_UDP"
 }
 
@@ -444,12 +484,25 @@ create_isp() {
   load_manager; local index id name listen_default listen_port public_port mode auth config service uri_file tmp outbound
   index=$(next_isp_slot); id="isp$index"; name="HY2-ISP-Full-$index"; [[ $index == 1 ]] && name=HY2-ISP-Full
   mode=$NETWORK_MODE; listen_default=$((7443 + index * 1000))
-  listen_port=$(ask "ISP 全局节点" "VPS 内部 UDP 监听端口" "$listen_default") || return
-  valid_port "$listen_port" || die "内部端口无效。"; port_free "$listen_port" udp || die "UDP $listen_port 已占用。"
-  if [[ $mode == nat ]]; then public_port=$(ask "NAT 映射" "服务商控制台的公网 UDP 端口" "") || return; else public_port=$listen_port; fi
-  valid_port "$public_port" || die "公网端口无效。"; public_port_free "$public_port" || die "公网端口 $public_port 已被其他节点记录。"
-  name=$(ask "ISP 全局节点" "节点名称" "$name") || return; valid_name "$name" || die "节点名称只允许字母、数字、点、下划线和短横线。"
-  read_socks; verify_socks
+  while true; do
+    listen_port=$(ask_valid_port "ISP 全局节点" "VPS 内部 UDP 监听端口" "$listen_default") || return $?
+    if port_free "$listen_port" udp; then break; fi
+    warn "UDP $listen_port 已占用，请重新输入。"
+  done
+  if [[ $mode == nat ]]; then
+    while true; do
+      public_port=$(ask_valid_port "NAT 映射" "服务商控制台的公网 UDP 端口" "") || return $?
+      if public_port_free "$public_port"; then break; fi
+      warn "公网端口 $public_port 已被其他节点记录，请重新输入。"
+    done
+  else public_port=$listen_port; fi
+  name=$(ask_valid_name "ISP 全局节点" "节点名称" "$name") || return $?
+  while true; do
+    read_socks || return $?
+    if verify_socks; then break; fi
+    unset SOCKS_PASS
+    confirm "SOCKS5 测试失败，是否重新输入 SOCKS5 信息？选择否将返回主菜单。" || return 0
+  done
   auth=$(openssl rand -hex 24); config="$HYSTERIA_DIR/$id.yaml"; service="hy2m-$id.service"; uri_file="$EXPORT_DIR/hy2-$id.txt"; outbound="isp_all_$index"
   tmp=$(mktemp); cleanup_files+=("$tmp")
   render_isp_config "$listen_port" "$auth" "$outbound" >"$tmp"
@@ -468,15 +521,23 @@ create_isp() {
 replace_isp() {
   load_manager
   local id f old_name old_listen old_public old_service old_config old_uri old_mode auth outbound tmp backup
-  id=$(ask "更换 ISP" "节点 ID（例如 isp1）" "isp1") || return
-  [[ $id =~ ^isp[0-9]+$ ]] || die "只能更换 ISP 节点。"
-  f="$NODE_DIR/$id.env"; [[ -r $f ]] || die "节点不存在：$id"
+  while true; do
+    id=$(ask "更换 ISP" "节点 ID（例如 isp1）" "isp1") || return $?
+    if [[ $id =~ ^isp[0-9]+$ && -r $NODE_DIR/$id.env ]]; then break; fi
+    warn "只能选择已存在的 ISP 节点，请重新输入。"
+  done
+  f="$NODE_DIR/$id.env"
   # shellcheck disable=SC1090
   source "$f"
   old_name=$NAME; old_listen=$LISTEN_PORT; old_public=$PUBLIC_PORT; old_service=$SERVICE; old_config=$CONFIG; old_uri=$URI_FILE; old_mode=$NETWORK_MODE
   auth=$(awk -F'"' '/^[[:space:]]*password:/{print $2; exit}' "$old_config")
   [[ $auth =~ ^[0-9a-f]{48}$ ]] || die "无法安全读取现有 HY2 认证信息。"
-  read_socks; verify_socks
+  while true; do
+    read_socks || return $?
+    if verify_socks; then break; fi
+    unset SOCKS_PASS
+    confirm "SOCKS5 测试失败，是否重新输入？选择否将返回主菜单。" || return 0
+  done
   outbound="isp_all_${id#isp}"; tmp=$(mktemp); backup=$(mktemp); cleanup_files+=("$tmp" "$backup")
   render_isp_config "$old_listen" "$auth" "$outbound" >"$tmp"; cp -a "$old_config" "$backup"
   install -o root -g hysteria -m 640 "$tmp" "$old_config"
@@ -528,7 +589,11 @@ diagnose() {
 
 remove_node() {
   load_manager; local id f
-  id=$(ask "删除节点" "节点 ID（例如 direct、isp1）" "") || return; f="$NODE_DIR/$id.env"; [[ -r $f ]] || die "节点不存在。"
+  while true; do
+    id=$(ask "删除节点" "节点 ID（例如 direct、isp1）" "") || return $?
+    f="$NODE_DIR/$id.env"; [[ -r $f ]] && break
+    warn "节点不存在，请重新输入。"
+  done
   unset SERVICE CONFIG URI_FILE LISTEN_PORT
   # shellcheck disable=SC1090
   source "$f"
@@ -557,27 +622,63 @@ initial_install() {
   [[ ! -e $MANAGER_STATE ]] || die "已经安装，请使用管理菜单。"
   os_check; require_systemd
   log "安装依赖……"; install_packages; ensure_layout; install_hysteria
-  local mode domain public_ip cert_mode email token
-  mode=$(choose "网络类型" "请选择 VPS 类型" normal "普通公网 VPS" nat "NAT / 端口映射 VPS") || return
-  [[ $mode == normal || $mode == nat ]] || die "网络类型无效。"
-  domain=$(ask "域名" "HY2 域名（Cloudflare 必须灰云）" "") || return; valid_domain "$domain" || die "域名无效。"
-  if [[ $mode == normal ]]; then public_ip=$(get_public_ipv4); else public_ip=$(ask "NAT 公网 IP" "服务商控制台显示的绑定公网 IPv4" "") || return; fi
-  valid_ipv4 "$public_ip" || die "公网 IPv4 格式无效。"
-  check_dns "$domain" "$public_ip"
-  cert_mode=$(choose "证书" "请选择证书验证方式" http "HTTP-01（需要公网 80→内部80）" cloudflare "Cloudflare DNS-01（适合 NAT）") || return
-  email=$(ask "证书" "Let's Encrypt 邮箱（可以留空）" "") || return
+  local mode="" domain="" public_ip="" cert_mode="" email="" token="" resumed=0
+  if [[ -r $INSTALL_SESSION ]] && confirm "检测到未完成的安装进度，是否从域名/证书步骤继续？"; then
+    # shellcheck disable=SC1090
+    source "$INSTALL_SESSION"
+    mode=${INSTALL_MODE:-}; domain=${INSTALL_DOMAIN:-}; public_ip=${INSTALL_PUBLIC_IP:-}; cert_mode=${INSTALL_CERT_MODE:-}; email=${INSTALL_EMAIL:-}
+    if [[ $mode =~ ^(normal|nat)$ ]] && valid_domain "$domain" && valid_ipv4 "$public_ip" && [[ $cert_mode =~ ^(http|cloudflare)$ ]] && check_dns "$domain" "$public_ip"; then
+      resumed=1; ok "已恢复非敏感安装进度；Token 等秘密不会写入断点文件。"
+    else
+      warn "保存的进度已失效，将重新填写。"; rm -f "$INSTALL_SESSION"
+    fi
+  fi
+  if ((resumed == 0)); then
+    while true; do
+      mode=$(choose "网络类型" "请选择 VPS 类型" normal "普通公网 VPS" nat "NAT / 端口映射 VPS") || return $?
+      [[ $mode == normal || $mode == nat ]] && break
+      warn "网络类型无效，请重新选择。"
+    done
+    while true; do
+      domain=$(ask_valid_domain "域名" "HY2 域名（Cloudflare 必须灰云）" "") || return $?
+      if [[ $mode == normal ]]; then
+        if ! public_ip=$(get_public_ipv4); then warn "无法获取公网 IPv4。"; confirm "是否重试域名和公网 IP 步骤？" && continue || return 0; fi
+      else
+        public_ip=$(ask_valid_ipv4 "NAT 公网 IP" "服务商控制台显示的绑定公网 IPv4" "") || return $?
+      fi
+      if check_dns "$domain" "$public_ip"; then break; fi
+      confirm "DNS 检查失败，是否重新填写域名和公网 IP？选择否将返回主菜单。" || return 0
+    done
+    while true; do
+      cert_mode=$(choose "证书" "请选择证书验证方式" http "HTTP-01（需要公网 80→内部80）" cloudflare "Cloudflare DNS-01（适合 NAT）") || return $?
+      [[ $cert_mode == http || $cert_mode == cloudflare ]] && break
+      warn "证书方式无效，请重新选择。"
+    done
+    email=$(ask "证书" "Let's Encrypt 邮箱（可以留空）" "") || return $?
+    write_env "$INSTALL_SESSION" INSTALL_MODE "$mode" INSTALL_DOMAIN "$domain" INSTALL_PUBLIC_IP "$public_ip" INSTALL_CERT_MODE "$cert_mode" INSTALL_EMAIL "$email"
+    ok "已保存非敏感安装进度；失败后可继续，断点文件不保存 Token。"
+  fi
   make_backup; configure_network
   if certificate_valid "$domain"; then
     ok "检测到 30 天以上有效期的现有证书，将安全复用。"
   elif [[ $cert_mode == http ]]; then
-    [[ $mode == normal ]] || confirm "NAT 模式必须确认公网 TCP 80 → 内部 TCP 80，是否继续？" || return
-    certificate_http "$domain" "$email"
+    while true; do
+      if [[ $mode != normal ]] && ! confirm "NAT 模式必须确认公网 TCP 80 → 内部 TCP 80，是否继续？"; then return 0; fi
+      certificate_http "$domain" "$email" && break
+      confirm "HTTP-01 失败，是否在当前步骤重试？选择否将保留进度并返回主菜单。" || return 0
+    done
   elif [[ $cert_mode == cloudflare ]]; then
-    token=$(ask_secret "Cloudflare" "请输入仅含 Zone.DNS Edit 权限的 API Token") || return; [[ -n $token ]] || die "Token 不能为空。"
-    certificate_cloudflare "$domain" "$email" "$token"; unset token
-  else die "证书方式无效。"; fi
+    while true; do
+      token=$(ask_secret "Cloudflare" "请输入仅含 Zone.DNS Edit 权限的 API Token") || return $?
+      if [[ -z $token ]]; then warn "Token 不能为空，请重新输入。"; continue; fi
+      if certificate_cloudflare "$domain" "$email" "$token"; then unset token; break; fi
+      unset token
+      confirm "DNS-01 失败，是否重新输入 Token？选择否将保留进度并返回主菜单。" || return 0
+    done
+  fi
   copy_certificate "$domain"
   write_env "$MANAGER_STATE" INSTALLED_VERSION "$APP_VERSION" DOMAIN "$domain" PUBLIC_IP "$public_ip" NETWORK_MODE "$mode" CERT_MODE "$cert_mode"
+  rm -f "$INSTALL_SESSION"
   log "创建 HY2 直连节点……"; create_direct
   if confirm "现在添加 ISP SOCKS5 全局节点？"; then create_isp; fi
   ok "安装完成。运行 hy2-manager 查看菜单。"
@@ -593,7 +694,7 @@ main_menu() {
   while true; do
     c=$(choose "$APP_NAME $APP_VERSION" "请选择操作" 1 "全新安装" 2 "创建/补建 HY2 直连节点" 3 "添加 ISP SOCKS5 全局节点" 4 "更换现有 ISP SOCKS5" 5 "查看节点与二维码" 6 "查看状态" 7 "一键诊断" 8 "删除指定节点" 9 "备份当前配置" 10 "卸载" 0 "退出") || return
     case $c in
-      1) initial_install ;; 2) create_direct ;; 3) create_isp ;; 4) replace_isp ;; 5) show_nodes ;; 6) status_all ;; 7) diagnose ;; 8) remove_node ;; 9) make_backup ;; 10) uninstall_all; return ;; 0) return ;; *) warn "无效选择。" ;;
+      1) run_menu_action initial_install ;; 2) run_menu_action create_direct ;; 3) run_menu_action create_isp ;; 4) run_menu_action replace_isp ;; 5) run_menu_action show_nodes ;; 6) run_menu_action status_all ;; 7) run_menu_action diagnose ;; 8) run_menu_action remove_node ;; 9) run_menu_action make_backup ;; 10) run_menu_action uninstall_all; [[ -e /usr/local/sbin/hy2-manager ]] || return ;; 0) return ;; *) warn "无效选择。" ;;
     esac
     is_tty && { printf '\n按 Enter 返回菜单……'; read -r; }
   done
