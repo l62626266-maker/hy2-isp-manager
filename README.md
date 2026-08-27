@@ -8,7 +8,7 @@
 - Let’s Encrypt HTTP-01 与 Cloudflare DNS-01；
 - v2rayN URI、终端二维码、状态、诊断、备份和安全卸载。
 
-> 当前稳定版本：`v0.1.1`；交互改进测试版：`v0.2.0-beta.1`。测试版增加输入原地重试、菜单错误隔离和非敏感安装断点。ISP SOCKS5 仍需使用有效服务实机验证。
+> 当前稳定版本：`v0.2.0`。已在 LXD NAT VPS 与 KVM 公网 VPS 验证输入重试、菜单错误隔离、证书、服务、SOCKS5 TCP认证、ISP出口、清理恢复及重启持久化。
 
 ## 支持环境
 
@@ -23,7 +23,7 @@
 固定版本发布后：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/v0.2.0-beta.1/install.sh -o /tmp/hy2-install.sh
+curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/v0.2.0/install.sh -o /tmp/hy2-install.sh
 bash -n /tmp/hy2-install.sh
 sudo bash /tmp/hy2-install.sh
 ```
