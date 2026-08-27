@@ -15,9 +15,9 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
       - name: Bash syntax
-        run: bash -n hy2-manager install.sh tests/*.sh
+        run: bash -n hy2-manager hy2-cert-guard install.sh install-cert-guard.sh tests/*.sh
       - name: ShellCheck
-        run: shellcheck -x hy2-manager install.sh tests/*.sh
+        run: shellcheck -x hy2-manager hy2-cert-guard install.sh install-cert-guard.sh tests/*.sh
       - name: Contract tests
         run: bash tests/run.sh
       - name: Pinned Hysteria config smoke test

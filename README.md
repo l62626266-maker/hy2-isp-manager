@@ -122,6 +122,35 @@ VPS 内部 UDP 监听端口
 
 权限为 `600 root:root`，Certbot 自动续期需要保留该文件。不要使用 Global API Key。
 
+## 独立证书守护器
+
+`hy2-cert-guard` 是同仓库中的独立工具，不加入 `hy2-manager` 菜单，也可以管理手工部署的 Hysteria 服务。
+
+固定版本安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/cert-guard-v0.1.0/install-cert-guard.sh -o /tmp/install-cert-guard.sh
+bash -n /tmp/install-cert-guard.sh
+sudo bash /tmp/install-cert-guard.sh
+```
+
+常用命令：
+
+```bash
+hy2-cert-guard status
+sudo hy2-cert-guard check
+sudo hy2-cert-guard dry-run
+hy2-cert-guard logs
+```
+
+它会安装每日 `systemd` timer、Certbot deploy hook 和 SSH 登录提示，检查证书有效期、证书/私钥匹配、部署证书一致性、Certbot timer、DNS、TCP 80、UFW、HY2 服务和 UDP 端口。续期成功后原子替换证书并重启登记服务；失败时自动恢复部署前证书并生成：
+
+```text
+/root/HY2-CERTIFICATE-ALERT.txt
+```
+
+非敏感状态保存在 `/var/lib/hy2-cert-guard/status`。旧 Hysteria deploy hooks 会先移动到 `/var/lib/hy2-cert-guard/legacy-hooks/<timestamp>/`，不会永久删除。`dry-run` 不使用 `--run-deploy-hooks`，不会把 Let’s Encrypt staging 证书部署到生产节点。
+
 ## 节点结构
 
 ### HY2 Direct
@@ -138,7 +167,7 @@ VPS 内部 UDP 监听端口
 
 ISP 节点配置只定义 SOCKS5 outbound，并使用该 outbound 匹配 `all`。配置中没有 direct fallback：正常情况下 ISP 失效时节点会失败，而不是主动改走 VPS 出口。
 
-当前 Beta 的“失败关闭”属于 **Hysteria 配置层保证**，尚未增加每节点独立 UID、network namespace 或 nftables 出站白名单，因此不把它宣传为内核级绝对隔离。强对抗场景应等待后续隔离版及数据包级实测。
+当前版本的“失败关闭”属于 **Hysteria 配置层保证**，尚未增加每节点独立 UID、network namespace 或 nftables 出站白名单，因此不把它宣传为内核级绝对隔离。强对抗场景应等待后续隔离版及数据包级实测。
 
 如果 ISP SOCKS5 不支持 UDP，普通 TCP/HTTPS 网页通常仍可使用，但游戏、QUIC/HTTP3 或必须使用 UDP 的应用可能失败或回退 TCP。
 

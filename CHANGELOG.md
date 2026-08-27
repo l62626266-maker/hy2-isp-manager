@@ -1,5 +1,13 @@
 # Changelog
 
+## cert-guard-v0.1.0
+
+- 新增独立 `hy2-cert-guard`，不集成原管理器菜单。
+- 每日检查证书、私钥、部署副本、Certbot、DNS、TCP 80、UFW、HY2服务和UDP端口。
+- 新增续期部署、双服务重启、失败回滚、root告警、SSH登录提示和dry-run。
+- 旧Hysteria续期钩子只备份不删除。
+- 在KVM生产VPS完成正常/异常告警、权限失败修复、部署回滚、真实dry-run、timer、登录提示、卸载重装及重启验证。
+
 ## v0.2.0
 
 - 将交互重试、菜单错误隔离和非敏感安装断点转为稳定功能。

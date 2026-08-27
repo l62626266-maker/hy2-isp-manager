@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -uo pipefail
+umask 077
+
+readonly APP_VERSION="0.1.0"
+readonly CONFIG_FILE="${HY2CG_CONFIG:-/etc/hy2-cert-guard.conf}"
+readonly STATE_DIR="${HY2CG_STATE_DIR:-/var/lib/hy2-cert-guard}"
+readonly STATUS_FILE="$STATE_DIR/status"
+readonly ALERT_FILE="${HY2CG_ALERT_FILE:-/root/HY2-CERTIFICATE-ALERT.txt}"
+readonly HOOK_FILE="${HY2CG_HOOK_FILE:-/etc/letsencrypt/renewal-hooks/deploy/hy2-cert-guard}"
+readonly SERVICE_FILE="${HY2CG_SERVICE_FILE:-/etc/systemd/system/hy2-cert-guard.service}"
+readonly TIMER_FILE="${HY2CG_TIMER_FILE:-/etc/systemd/system/hy2-cert-guard.timer}"
+readonly PROFILE_FILE="${HY2CG_PROFILE_FILE:-/etc/profile.d/hy2-cert-guard.sh}"
+
+DOMAIN=""; EXPECTED_IPV4=""; LIVE_DIR=""; DEPLOY_CERT=""; DEPLOY_KEY=""
+SERVICES=""; UDP_PORTS=""; WARN_DAYS=30; FAIL_DAYS=14
+passes=0; warnings=0; failures=0; messages=()
+
+if [[ -t 1 ]]; then C_RESET='\033[0m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[1;31m'; C_BLUE='\033[1;34m'; else C_RESET=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_BLUE=''; fi
+pass() { passes=$((passes+1)); printf '%b[PASS]%b %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { warnings=$((warnings+1)); messages+=("WARN: $*"); printf '%b[WARN]%b %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+fail() { failures=$((failures+1)); messages+=("FAIL: $*"); printf '%b[FAIL]%b %s\n' "$C_RED" "$C_RESET" "$*"; }
+info() { printf '%b[INFO]%b %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+die() { printf '%b[错误]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "该操作需要 root。"; }
+valid_domain() { [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+valid_ipv4() { local IFS=. a n; read -r -a a <<<"$1"; ((${#a[@]}==4)) || return 1; for n in "${a[@]}"; do [[ $n =~ ^[0-9]{1,3}$ ]] && ((10#$n<=255)) || return 1; done; }
+valid_path() { [[ $1 == /* && $1 != *$'\n'* && $1 != *'/../'* && $1 != */.. ]]; }
+
+load_config() {
+  [[ -r $CONFIG_FILE ]] || die "配置不存在：$CONFIG_FILE"
+  local owner mode
+  owner=$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null) || die "无法读取配置所有者。"
+  mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null) || die "无法读取配置权限。"
+  [[ $owner == 0 ]] || die "配置必须归 root 所有。"
+  (( (8#$mode & 022) == 0 )) || die "配置不能允许组或其他用户写入。"
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  valid_domain "$DOMAIN" || die "配置中的 DOMAIN 无效。"
+  [[ -z $EXPECTED_IPV4 ]] || valid_ipv4 "$EXPECTED_IPV4" || die "配置中的 EXPECTED_IPV4 无效。"
+  if ! valid_path "$LIVE_DIR" || ! valid_path "$DEPLOY_CERT" || ! valid_path "$DEPLOY_KEY"; then die "证书路径无效。"; fi
+  [[ $WARN_DAYS =~ ^[0-9]+$ && $FAIL_DAYS =~ ^[0-9]+$ ]] || die "告警天数无效。"
+  ((WARN_DAYS > FAIL_DAYS && FAIL_DAYS > 0)) || die "必须满足 WARN_DAYS > FAIL_DAYS > 0。"
+  local unit port
+  for unit in $SERVICES; do [[ $unit =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die "服务名无效：$unit"; done
+  for port in $UDP_PORTS; do if [[ ! $port =~ ^[0-9]+$ ]] || ((10#$port<1 || 10#$port>65535)); then die "UDP端口无效：$port"; fi; done
+}
+
+cert_pub_hash() { openssl x509 -in "$1" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}'; }
+key_pub_hash() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}'; }
+cert_pair_matches() { local a b; a=$(cert_pub_hash "$1") || return 1; b=$(key_pub_hash "$2") || return 1; [[ -n $a && $a == "$b" ]]; }
+cert_fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+cert_days_left() { local end now; end=$(openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2-) || return 1; [[ -n $end ]] || return 1; end=$(date -d "$end" +%s 2>/dev/null) || return 1; now=$(date +%s); printf '%d' "$(( (end-now) / 86400 ))"; }
+cert_has_domain() { openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null | grep -Fq "DNS:$2"; }
+
+write_result() {
+  local state=$1 days=$2 expiry=$3 timer=$4 services=$5 service_details=$6 tmp
+  install -d -o root -g root -m 755 "$STATE_DIR"
+  tmp=$(mktemp "$STATE_DIR/.status.XXXXXX") || return 1
+  {
+    printf 'STATE=%q\n' "$state"
+    printf 'CHECKED_AT=%q\n' "$(date -Is)"
+    printf 'DOMAIN=%q\n' "$DOMAIN"
+    printf 'DAYS_LEFT=%q\n' "$days"
+    printf 'EXPIRES_AT=%q\n' "$expiry"
+    printf 'CERTBOT_TIMER=%q\n' "$timer"
+    printf 'SERVICES_STATE=%q\n' "$services"
+    printf 'SERVICE_DETAILS=%q\n' "$service_details"
+    printf 'PASS_COUNT=%q\nWARN_COUNT=%q\nFAIL_COUNT=%q\n' "$passes" "$warnings" "$failures"
+  } >"$tmp"
+  chmod 644 "$tmp"; mv -f "$tmp" "$STATUS_FILE"
+  if [[ $state == FAIL ]]; then
+    {
+      printf 'HY2 CERTIFICATE ALERT\nChecked: %s\nDomain: %s\nDays left: %s\n\n' "$(date -Is)" "$DOMAIN" "$days"
+      printf '%s\n' "${messages[@]}"
+      printf '\nRun: hy2-cert-guard check\nLogs: journalctl -u hy2-cert-guard.service\n'
+    } >"$ALERT_FILE"
+    chmod 600 "$ALERT_FILE"
+  else
+    rm -f "$ALERT_FILE"
+  fi
+}
+
+resolve_ipv4() {
+  if command -v dig >/dev/null 2>&1; then dig +short A "$1" | sort -u
+  else getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u
+  fi
+}
+
+check_all() {
+  require_root; load_config
+  passes=0; warnings=0; failures=0; messages=()
+  local live_cert="$LIVE_DIR/fullchain.pem" live_key="$LIVE_DIR/privkey.pem" days="unknown" expiry="unknown" timer_state="unknown" services_state="ok"
+  printf 'HY2 Certificate Guard %s\n时间: %s\n\n' "$APP_VERSION" "$(date -Is)"
+
+  if [[ -r $live_cert && -r $live_key ]]; then pass "Let’s Encrypt证书和私钥存在"; else fail "Let’s Encrypt证书或私钥缺失：$LIVE_DIR"; fi
+  if [[ -r $live_cert ]]; then
+    if cert_has_domain "$live_cert" "$DOMAIN"; then pass "证书包含域名 $DOMAIN"; else fail "证书不包含域名 $DOMAIN"; fi
+    days=$(cert_days_left "$live_cert" 2>/dev/null || printf unknown)
+    expiry=$(openssl x509 -in "$live_cert" -noout -enddate 2>/dev/null | cut -d= -f2-)
+    if [[ $days =~ ^-?[0-9]+$ ]]; then
+      if ((days < FAIL_DAYS)); then fail "证书仅剩 $days 天"; elif ((days < WARN_DAYS)); then warn "证书剩余 $days 天，Certbot应进入续期窗口"; else pass "证书剩余 $days 天"; fi
+    else fail "无法读取证书有效期"; fi
+  fi
+  if [[ -r $live_cert && -r $live_key ]] && cert_pair_matches "$live_cert" "$live_key"; then pass "Let’s Encrypt证书与私钥匹配"; else fail "Let’s Encrypt证书与私钥不匹配"; fi
+  if [[ -r $DEPLOY_CERT && -r $DEPLOY_KEY ]]; then pass "HY2部署证书和私钥存在"; else fail "HY2部署证书或私钥缺失"; fi
+  if id hysteria >/dev/null 2>&1; then
+    if runuser -u hysteria -- test -r "$DEPLOY_CERT" && runuser -u hysteria -- test -r "$DEPLOY_KEY"; then pass "hysteria用户可以读取部署证书"; else fail "hysteria用户无法读取部署证书或目录"; fi
+  else warn "没有hysteria用户，无法执行证书读取权限检查"; fi
+  if [[ -r $DEPLOY_CERT && -r $DEPLOY_KEY ]] && cert_pair_matches "$DEPLOY_CERT" "$DEPLOY_KEY"; then pass "HY2部署证书与私钥匹配"; else fail "HY2部署证书与私钥不匹配"; fi
+  if [[ -r $live_cert && -r $DEPLOY_CERT ]] && [[ $(cert_fingerprint "$live_cert") == "$(cert_fingerprint "$DEPLOY_CERT")" ]]; then pass "Let’s Encrypt证书与HY2部署证书一致"; else fail "Let’s Encrypt证书与HY2部署证书不一致"; fi
+
+  if systemctl is-enabled --quiet certbot.timer 2>/dev/null && systemctl is-active --quiet certbot.timer 2>/dev/null; then timer_state=active; pass "certbot.timer 已启用并运行"; else timer_state=failed; fail "certbot.timer 未同时处于 enabled/active"; fi
+  next_run=$(systemctl show certbot.timer -p NextElapseUSecRealtime --value 2>/dev/null || true); [[ -n $next_run ]] && info "Certbot下次计划: $next_run"
+
+  resolved=$(resolve_ipv4 "$DOMAIN")
+  if [[ -z $EXPECTED_IPV4 ]]; then warn "未配置 EXPECTED_IPV4；当前解析：${resolved:-none}"
+  elif grep -Fxq "$EXPECTED_IPV4" <<<"$resolved"; then pass "域名解析包含 $EXPECTED_IPV4"; else fail "域名未解析到 $EXPECTED_IPV4（当前：${resolved:-none}）"; fi
+  if ss -H -ltn 2>/dev/null | awk '$4 ~ /:80$/ {found=1} END{exit !found}'; then warn "TCP 80当前被进程占用；standalone续期可能需要pre-hook"; else pass "TCP 80空闲，可供Certbot standalone临时监听"; fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ufw status 2>/dev/null | awk '{print $1}' | grep -Fxq '80/tcp'; then pass "UFW允许TCP 80"; else fail "UFW启用但未发现80/tcp允许规则"; fi
+  else info "UFW未启用；请由服务商防火墙保证TCP 80可达"; fi
+
+  local unit enabled active service_summary=()
+  for unit in $SERVICES; do
+    active=$(systemctl is-active "$unit" 2>/dev/null || true); enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    service_summary+=("$unit:$active/$enabled")
+    if [[ $active == active ]]; then pass "$unit 正在运行"; else fail "$unit 未运行（$active）"; services_state=failed; fi
+    case $enabled in enabled|enabled-runtime|static) pass "$unit 启动状态: $enabled" ;; *) warn "$unit 启动状态: ${enabled:-unknown}" ;; esac
+  done
+  listeners=$(ss -H -lun 2>/dev/null || true)
+  local port
+  for port in $UDP_PORTS; do
+    if awk -v p=":$port" '$4 ~ (p "$" ) {found=1} END{exit !found}' <<<"$listeners"; then pass "UDP $port 正在监听"; else fail "UDP $port 未监听"; services_state=failed; fi
+  done
+
+  local final=OK
+  ((failures > 0)) && final=FAIL
+  if ((failures == 0 && warnings > 0)); then final=WARN; fi
+  write_result "$final" "$days" "$expiry" "$timer_state" "$services_state" "${service_summary[*]}"
+  printf '\nPASS=%d WARN=%d FAIL=%d\n' "$passes" "$warnings" "$failures"
+  printf '状态: %s；证书剩余: %s 天；到期: %s\n' "$final" "$days" "$expiry"
+  ((failures == 0))
+}
+
+status_cmd() {
+  if [[ ! -r $STATUS_FILE ]]; then printf '尚无状态记录，请运行：sudo hy2-cert-guard check\n'; return 1; fi
+  # shellcheck disable=SC1090
+  source "$STATUS_FILE"
+  printf 'HY2证书：%s｜域名：%s｜剩余：%s天｜Certbot：%s｜检查：%s\n' "${STATE:-unknown}" "${DOMAIN:-unknown}" "${DAYS_LEFT:-unknown}" "${CERTBOT_TIMER:-unknown}" "${CHECKED_AT:-unknown}"
+  [[ ${STATE:-FAIL} != FAIL ]]
+}
+
+deploy_cert() {
+  require_root; load_config
+  local lineage cert key
+  lineage=${RENEWED_LINEAGE:-${1:-$LIVE_DIR}}; cert="$lineage/fullchain.pem"; key="$lineage/privkey.pem"
+  if [[ -n ${RENEWED_DOMAINS:-} ]]; then case " $RENEWED_DOMAINS " in *" $DOMAIN "*) ;; *) info "本次续期不包含 $DOMAIN，跳过。"; return 0 ;; esac; fi
+  [[ -r $cert && -r $key ]] || die "续期证书或私钥不存在：$lineage"
+  cert_has_domain "$cert" "$DOMAIN" || die "新证书不包含 $DOMAIN"
+  cert_pair_matches "$cert" "$key" || die "新证书与私钥不匹配"
+  local backup cert_tmp key_tmp unit failed=0 cert_dir key_dir
+  backup="$STATE_DIR/deploy-backups/$(date +%Y%m%d-%H%M%S)"; cert_dir=$(dirname "$DEPLOY_CERT"); key_dir=$(dirname "$DEPLOY_KEY")
+  install -d -o root -g root -m 700 "$backup"
+  [[ -d $cert_dir ]] || install -d -o root -g hysteria -m 750 "$cert_dir"
+  [[ -d $key_dir ]] || install -d -o root -g hysteria -m 750 "$key_dir"
+  [[ -e $DEPLOY_CERT ]] && cp -a "$DEPLOY_CERT" "$backup/fullchain.pem.before"
+  [[ -e $DEPLOY_KEY ]] && cp -a "$DEPLOY_KEY" "$backup/privkey.pem.before"
+  cert_tmp=$(mktemp "$(dirname "$DEPLOY_CERT")/.fullchain.XXXXXX") || die "无法创建证书临时文件"
+  key_tmp=$(mktemp "$(dirname "$DEPLOY_KEY")/.privkey.XXXXXX") || { rm -f "$cert_tmp"; die "无法创建私钥临时文件"; }
+  install -o root -g hysteria -m 640 "$cert" "$cert_tmp"
+  install -o root -g hysteria -m 640 "$key" "$key_tmp"
+  cert_pair_matches "$cert_tmp" "$key_tmp" || { rm -f "$cert_tmp" "$key_tmp"; die "临时证书校验失败"; }
+  if ! runuser -u hysteria -- test -r "$cert_tmp" || ! runuser -u hysteria -- test -r "$key_tmp"; then rm -f "$cert_tmp" "$key_tmp"; die "hysteria用户无法读取临时证书；未重启服务。"; fi
+  mv -f "$cert_tmp" "$DEPLOY_CERT"; mv -f "$key_tmp" "$DEPLOY_KEY"
+  for unit in $SERVICES; do systemctl try-restart "$unit" >/dev/null 2>&1 || failed=1; done
+  sleep 2
+  for unit in $SERVICES; do systemctl is-active --quiet "$unit" || failed=1; done
+  if ((failed)); then
+    warn "服务重启验证失败，恢复部署前证书。"
+    [[ -e $backup/fullchain.pem.before ]] && cp -a "$backup/fullchain.pem.before" "$DEPLOY_CERT"
+    [[ -e $backup/privkey.pem.before ]] && cp -a "$backup/privkey.pem.before" "$DEPLOY_KEY"
+    for unit in $SERVICES; do systemctl try-restart "$unit" >/dev/null 2>&1 || true; done
+    check_all >/dev/null 2>&1 || true
+    die "证书部署失败，已尝试回滚。"
+  fi
+  info "证书部署完成，备份：$backup"
+  check_all
+}
+
+install_system() {
+  require_root; load_config
+  install -d -o root -g root -m 755 "$STATE_DIR" /etc/letsencrypt/renewal-hooks/deploy
+  cat >"$SERVICE_FILE" <<EOF
+[Unit]
+Description=HY2 certificate and renewal health check
+After=network-online.target certbot.timer
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hy2-cert-guard check
+EOF
+  cat >"$TIMER_FILE" <<'EOF'
+[Unit]
+Description=Daily HY2 certificate health check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+Unit=hy2-cert-guard.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  cat >"$HOOK_FILE" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec /usr/local/sbin/hy2-cert-guard deploy
+EOF
+  chmod 755 "$HOOK_FILE"
+  cat >"$PROFILE_FILE" <<'EOF'
+#!/usr/bin/env bash
+[[ $- == *i* && -r /var/lib/hy2-cert-guard/status ]] || return 0
+# shellcheck disable=SC1091
+source /var/lib/hy2-cert-guard/status
+if [[ ${STATE:-FAIL} == FAIL ]]; then
+  printf '\033[1;31mHY2证书：异常｜剩余：%s天｜运行 sudo hy2-cert-guard check\033[0m\n' "${DAYS_LEFT:-unknown}"
+else
+  printf 'HY2证书：%s｜剩余：%s天｜自动续期：%s｜服务：%s\n' "${STATE:-unknown}" "${DAYS_LEFT:-unknown}" "${CERTBOT_TIMER:-unknown}" "${SERVICES_STATE:-unknown}"
+fi
+EOF
+  chmod 644 "$SERVICE_FILE" "$TIMER_FILE" "$PROFILE_FILE"
+  systemctl daemon-reload
+  systemctl enable --now hy2-cert-guard.timer >/dev/null
+  if ! systemctl start hy2-cert-guard.service; then warn "首次证书健康检查失败，请运行 hy2-cert-guard check。"; return 1; fi
+  info "已安装每日检查、Certbot部署钩子和SSH登录提示。"
+}
+
+dry_run() { require_root; load_config; command -v certbot >/dev/null 2>&1 || die "缺少 certbot"; info "使用Let’s Encrypt staging执行续期演练，不运行生产部署钩子。"; certbot renew --cert-name "$DOMAIN" --dry-run; }
+logs_cmd() { journalctl -u hy2-cert-guard.service -u certbot.service --no-pager -n "${1:-100}"; }
+
+uninstall_system() {
+  require_root
+  systemctl disable --now hy2-cert-guard.timer >/dev/null 2>&1 || true
+  rm -f "$SERVICE_FILE" "$TIMER_FILE" "$HOOK_FILE" "$PROFILE_FILE"
+  systemctl daemon-reload
+  info "已卸载定时器、部署钩子和登录提示；配置、状态、告警及证书备份被保留。"
+}
+
+usage() {
+  cat <<EOF
+HY2 Certificate Guard $APP_VERSION
+用法：
+  sudo hy2-cert-guard check
+  hy2-cert-guard status
+  sudo hy2-cert-guard deploy [lineage]
+  sudo hy2-cert-guard dry-run
+  sudo hy2-cert-guard install-system
+  hy2-cert-guard logs [lines]
+  sudo hy2-cert-guard uninstall-system
+EOF
+}
+
+main() {
+  case ${1:-status} in
+    check) check_all ;; status) status_cmd ;; deploy) shift; deploy_cert "${1:-}" ;; dry-run) dry_run ;; install-system) install_system ;; logs) logs_cmd "${2:-100}" ;; uninstall-system) uninstall_system ;; version|--version) printf '%s\n' "$APP_VERSION" ;; help|-h|--help) usage ;; *) usage; exit 2 ;;
+  esac
+}
+
+if [[ ${HY2CG_SOURCE_ONLY:-0} != 1 ]]; then main "$@"; fi
