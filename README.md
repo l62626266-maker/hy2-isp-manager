@@ -8,7 +8,7 @@
 - Let’s Encrypt HTTP-01 与 Cloudflare DNS-01；
 - v2rayN URI、终端二维码、状态、诊断、备份和安全卸载。
 
-> 当前稳定版本：`v0.2.0`。已在 LXD NAT VPS 与 KVM 公网 VPS 验证输入重试、菜单错误隔离、证书、服务、SOCKS5 TCP认证、ISP出口、清理恢复及重启持久化。
+> 当前稳定版本：`v0.2.1`。已在 LXD NAT VPS 与 KVM 公网 VPS 验证输入重试、菜单错误隔离、证书、服务、节点独立状态、旧Direct兼容显示、SOCKS5 TCP认证、ISP出口、清理恢复及重启持久化。
 
 ## 支持环境
 
@@ -23,7 +23,7 @@
 固定版本发布后：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/v0.2.0/install.sh -o /tmp/hy2-install.sh
+curl -fsSL https://raw.githubusercontent.com/l62626266-maker/hy2-isp-manager/v0.2.1/install.sh -o /tmp/hy2-install.sh
 bash -n /tmp/hy2-install.sh
 sudo bash /tmp/hy2-install.sh
 ```
@@ -82,6 +82,14 @@ sudo hy2-manager backup
 sudo hy2-manager remove-node
 sudo hy2-manager uninstall
 ```
+
+节点依赖和显示规则：
+
+- 支持“只有Direct”以及“Direct + 一个或多个ISP”；不支持ISP脱离Direct单独存在。
+- 删除ISP只删除指定ISP，最后一个ISP删除后Direct继续显示和运行。
+- 仍有ISP记录时禁止删除其依赖的Direct。
+- `show`、`status` 和诊断不再把 `manager.env` 当作节点清单；即使旧版Direct没有管理器状态文件，也会通过 `/etc/hysteria/config.yaml` 和 `hysteria-server.service` 兼容显示。
+- 兼容显示为只读，不会重建、重启或覆盖旧Direct服务。
 
 ## 普通 VPS 与 NAT VPS
 

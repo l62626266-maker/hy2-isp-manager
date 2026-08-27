@@ -20,6 +20,11 @@ HY2M_STATE_DIR="$(mktemp -d)/state"; export HY2M_STATE_DIR
 HY2M_EXPORT_DIR="$(mktemp -d)/export"; export HY2M_EXPORT_DIR
 HY2M_HYSTERIA_DIR="$(mktemp -d)/hysteria"; export HY2M_HYSTERIA_DIR
 HY2M_BACKUP_DIR="$(mktemp -d)/backup"; export HY2M_BACKUP_DIR
+legacy_test_root=$(mktemp -d)
+HY2M_LEGACY_CONFIG="$legacy_test_root/config.yaml"; export HY2M_LEGACY_CONFIG
+HY2M_LEGACY_MANAGER_CONFIG="$legacy_test_root/manager.conf"; export HY2M_LEGACY_MANAGER_CONFIG
+HY2M_LEGACY_URI_FILE="$legacy_test_root/direct-uri.txt"; export HY2M_LEGACY_URI_FILE
+HY2M_LEGACY_TLS_CERT="$legacy_test_root/fullchain.pem"; export HY2M_LEGACY_TLS_CERT
 # shellcheck source=../hy2-manager
 source ./hy2-manager
 
@@ -42,7 +47,7 @@ source "$STATE_DIR/test.env"
 [[ $(stat -c '%a' "$STATE_DIR/test.env") == 600 ]] && pass "state mode 600" || fail "state mode 600"
 write_env "$MANAGER_STATE" APP_VERSION 'legacy-beta' DOMAIN 'state.example.com' PUBLIC_IP '192.0.2.1' NETWORK_MODE nat CERT_MODE cloudflare
 load_manager
-[[ $APP_VERSION == '0.2.0' && $DOMAIN == 'state.example.com' ]] && pass "legacy APP_VERSION state compatibility" || fail "legacy APP_VERSION state compatibility"
+[[ $APP_VERSION == '0.2.1' && $DOMAIN == 'state.example.com' ]] && pass "legacy APP_VERSION state compatibility" || fail "legacy APP_VERSION state compatibility"
 mkdir -p "$NODE_DIR"; printf 'PUBLIC_PORT=56777\n' >"$NODE_DIR/nat.env"
 if public_port_free 56777; then fail "reject duplicate NAT public port"; else pass "reject duplicate NAT public port"; fi
 check "allow unused NAT public port" public_port_free 56778
@@ -76,6 +81,39 @@ run_menu_action test_fail_action
 pass "menu isolates action failure"
 grep -Fq 'INSTALL_SESSION=' hy2-manager && grep -Fq '已恢复非敏感安装进度' hy2-manager && pass "non-secret install checkpoint" || fail "non-secret install checkpoint"
 grep -Fq 'SOCKS5 测试失败，是否重新输入' hy2-manager && pass "SOCKS failure retry path" || fail "SOCKS failure retry path"
+
+# Node inventory must remain independent: deleting ISP cannot hide Direct.
+rm -rf "$NODE_DIR"; mkdir -p "$NODE_DIR" "$EXPORT_DIR" "$HYSTERIA_DIR"
+printf 'direct-uri\n' >"$EXPORT_DIR/direct.txt"; printf 'isp-uri\n' >"$EXPORT_DIR/isp1.txt"
+printf 'direct-config\n' >"$HYSTERIA_DIR/direct.yaml"; printf 'isp-config\n' >"$HYSTERIA_DIR/isp1.yaml"
+save_node direct direct HY2-Direct 443 443 hy2m-direct.service "$HYSTERIA_DIR/direct.yaml" "$EXPORT_DIR/direct.txt" normal
+save_node isp1 isp HY2-ISP-Full 8443 8443 hy2m-isp1.service "$HYSTERIA_DIR/isp1.yaml" "$EXPORT_DIR/isp1.txt" normal
+TEST_CONFIRM=no
+confirm() { [[ $TEST_CONFIRM == yes ]]; }
+systemctl() { return 0; }
+view_before=$(show_nodes)
+[[ $view_before == *HY2-Direct* && $view_before == *HY2-ISP-Full* ]] && pass "show Direct and ISP independently" || fail "show Direct and ISP independently"
+TEST_CONFIRM=yes
+remove_node <<<'isp1' >/dev/null
+[[ -r $NODE_DIR/direct.env && ! -e $NODE_DIR/isp1.env ]] && pass "deleting ISP preserves Direct state" || fail "deleting ISP preserves Direct state"
+TEST_CONFIRM=no
+view_after=$(show_nodes)
+[[ $view_after == *HY2-Direct* && $view_after != *HY2-ISP-Full* ]] && pass "Direct remains visible after ISP deletion" || fail "Direct remains visible after ISP deletion"
+save_node isp1 isp HY2-ISP-Full 8443 8443 hy2m-isp1.service "$HYSTERIA_DIR/isp1.yaml" "$EXPORT_DIR/isp1.txt" normal
+if (TEST_CONFIRM=yes; remove_node <<<'direct' >/dev/null 2>&1); then fail "block deleting Direct while ISP exists"; else pass "block deleting Direct while ISP exists"; fi
+rm -f "$NODE_DIR/direct.env"
+if (show_nodes >/dev/null 2>&1); then fail "reject unsupported ISP-only inventory"; else pass "reject unsupported ISP-only inventory"; fi
+
+# Existing pre-manager Direct nodes remain visible without manager.env.
+rm -f "$MANAGER_STATE" "$NODE_DIR"/*.env
+printf 'listen: :443\n' >"$LEGACY_CONFIG"
+printf 'DOMAIN=legacy.example.com\n' >"$LEGACY_MANAGER_CONFIG"
+printf 'hysteria2://redacted@legacy.example.com:443/?sni=legacy.example.com#Direct\n' >"$LEGACY_URI_FILE"
+legacy_view=$(show_nodes)
+[[ $legacy_view == *'HY2-Direct（现有兼容节点）'* && $legacy_view == *'内部 UDP: 443'* ]] && pass "legacy Direct visible without manager state" || fail "legacy Direct visible without manager state"
+legacy_status=$(status_all)
+[[ $legacy_status == *'现有兼容节点视图'* && $legacy_status == *'legacy.example.com'* ]] && pass "legacy Direct status without manager state" || fail "legacy Direct status without manager state"
+grep -Fq '必须先存在HY2直连节点，才能添加ISP节点' hy2-manager && pass "ISP requires Direct" || fail "ISP requires Direct"
 
 if (( failures )); then printf '\n%d test(s) failed.\n' "$failures" >&2; exit 1; fi
 printf '\nAll tests passed.\n'

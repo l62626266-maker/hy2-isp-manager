@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.1
+
+- 修复删除ISP后Direct因缺少管理器状态文件而无法显示的问题。
+- `show`、`status` 和诊断可只读识别现有旧版Direct服务，不要求 `manager.env`。
+- Direct和ISP节点记录独立；删除ISP只移除指定ISP，Direct继续显示和运行。
+- ISP必须依赖Direct；仍有ISP记录时禁止删除Direct，并拒绝不受支持的ISP-only清单。
+- 新增Direct+ISP、删除ISP、旧Direct兼容显示和依赖约束回归测试。
+
 ## cert-guard-v0.1.0
 
 - 新增独立 `hy2-cert-guard`，不集成原管理器菜单。
