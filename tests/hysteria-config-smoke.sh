@@ -2,6 +2,8 @@
 # shellcheck disable=SC1091,SC2034
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
+mkdir -p .tmp
+export TMPDIR="${TMPDIR:-$PWD/.tmp}"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT

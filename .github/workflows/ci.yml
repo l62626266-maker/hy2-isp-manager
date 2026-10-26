@@ -15,11 +15,18 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
       - name: Bash syntax
-        run: bash -n hy2-manager hy2-cert-guard install.sh install-cert-guard.sh tests/*.sh
+        run: |
+          for file in hy2-manager hy2-cert-guard install.sh install-cert-guard.sh tests/*.sh; do
+            bash -n "$file" || exit 1
+          done
       - name: ShellCheck
         run: shellcheck -x hy2-manager hy2-cert-guard install.sh install-cert-guard.sh tests/*.sh
       - name: Contract tests
         run: bash tests/run.sh
+      - name: UI and transaction tests
+        run: bash tests/ui-test.sh && python3 tests/tty-test.py
+      - name: Certificate guard tests
+        run: bash tests/cert-guard-test.sh && bash tests/guard-discovery-test.sh
       - name: Pinned Hysteria config smoke test
         run: bash tests/hysteria-config-smoke.sh
       - name: Secret-pattern guard

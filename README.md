@@ -1,5 +1,9 @@
 # HY2 ISP Manager
 
+> 本地开发版：管理器 `0.3.0-dev` / 守护器 `0.1.1-dev`，尚未发布或部署到 VPS。
+> 新增 `hy2` 快捷入口、按节点管理的中文菜单、ISP 粘贴输入及端口修改回滚；详见 [开发版说明](doc/ui-optimization.md)。
+> 下方固定版本安装命令仍安装原稳定版，不会自动获取这些开发中的改动。
+
 一个面向普通用户的 Hysteria 2 终端管理器，重点解决：
 
 - 普通公网 VPS 与 NAT/端口映射 VPS；
@@ -14,6 +18,7 @@
 
 - Debian 12 / 13
 - Ubuntu 22.04 / 24.04
+- 开发版允许 Ubuntu 26.04 / 26.10 经明确确认后实验性安装，尚无真实 VPS 兼容性验证，不等同于稳定支持。
 - amd64 / arm64
 - systemd
 - root 权限
@@ -225,7 +230,11 @@ QUIC rmem_max/wmem_max = 16 MiB（完整 VM 且内核允许时）
 
 ```bash
 bash tests/run.sh
-shellcheck -x hy2-manager install.sh tests/run.sh
+bash tests/ui-test.sh
+bash tests/cert-guard-test.sh
+bash tests/guard-discovery-test.sh
+python3 tests/tty-test.py
+shellcheck -x hy2-manager hy2-cert-guard install.sh install-cert-guard.sh tests/*.sh
 ```
 
 测试覆盖语法、端口/域名校验、状态安全序列化、文件权限、TLS 安全字段、ISP fail-closed 静态契约、Cloudflare DNS-01、NAT 双端口和 Hysteria SHA256 校验。

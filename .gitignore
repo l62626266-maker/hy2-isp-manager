@@ -1,4 +1,6 @@
 .tmp/
+.local-tests/
+.audit-known-hosts
 *.log
 *.tar.gz
 .env

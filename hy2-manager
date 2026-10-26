@@ -4,10 +4,13 @@ set -Eeuo pipefail
 umask 077
 
 readonly APP_NAME="HY2 ISP Manager"
-readonly APP_VERSION="0.2.1"
+readonly APP_VERSION="0.3.0-dev"
 readonly APP_DIR="${HY2M_APP_DIR:-/opt/hy2-isp-manager}"
 readonly STATE_DIR="${HY2M_STATE_DIR:-/etc/hy2-isp-manager}"
 readonly NODE_DIR="$STATE_DIR/nodes"
+readonly SERVICE_DIR="${HY2M_SERVICE_DIR:-/etc/systemd/system}"
+readonly SBIN_DIR="${HY2M_SBIN_DIR:-/usr/local/sbin}"
+readonly BIN_DIR="${HY2M_BIN_DIR:-/usr/local/bin}"
 readonly EXPORT_DIR="${HY2M_EXPORT_DIR:-/root/hy2-export}"
 readonly HYSTERIA_DIR="${HY2M_HYSTERIA_DIR:-/etc/hysteria-hy2m}"
 readonly TLS_DIR="$HYSTERIA_DIR/tls"
@@ -46,7 +49,7 @@ require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：s
 require_systemd() { if ! command -v systemctl >/dev/null || [[ ! -d /run/systemd/system ]]; then die "需要正在运行的 systemd。"; fi; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
 
-valid_port() { [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 valid_domain() { [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
 valid_ipv4() { local IFS=. p n=0; read -r -a p <<<"$1"; ((${#p[@]} == 4)) || return 1; for n in "${p[@]}"; do [[ $n =~ ^[0-9]{1,3}$ ]] && ((10#$n <= 255)) || return 1; done; }
 valid_host() { [[ -n $1 && $1 != *[[:space:]/]* ]]; }
@@ -59,14 +62,15 @@ print(urllib.parse.quote(sys.argv[1], safe=''))
 PY
 }
 
-is_tty() { [[ -t 0 && -t 1 ]]; }
+# stdout is captured by $(ask/choose); dialogs use stderr.
+is_tty() { [[ -t 0 && -t 2 ]]; }
 has_whiptail() { is_tty && command -v whiptail >/dev/null 2>&1; }
 ask() {
   local title=$1 prompt=$2 default=${3:-} out
   if has_whiptail; then
-    out=$(whiptail --title "$title" --inputbox "$prompt" 10 72 "$default" 3>&1 1>&2 2>&3) || return 1
+    out=$(whiptail --title "$title" --ok-button "确定" --cancel-button "返回" --inputbox "$prompt" 0 0 "$default" 3>&1 1>&2 2>&3) || return 20
   else
-    read -r -p "$prompt${default:+ [$default]}: " out
+    read -r -p "$prompt${default:+ [$default]}（:menu 返回）: " out || return 20
     [[ -n $out ]] || out=$default
   fi
   if [[ $out == :menu ]]; then warn "已取消当前操作，返回主菜单。"; return 20; fi
@@ -80,7 +84,7 @@ ask_valid() {
     warn "$error_text 请重新输入，或输入 :menu 返回主菜单。"
   done
 }
-ask_valid_port() { ask_valid "$1" "$2" "$3" valid_port "端口必须是 1-65535 的整数。"; }
+ask_valid_port() { local port; port=$(ask_valid "$1" "$2" "$3" valid_port "端口必须是 1-65535 的整数。") || return $?; printf '%d' "$((10#$port))"; }
 ask_valid_domain() { ask_valid "$1" "$2" "$3" valid_domain "域名格式无效。"; }
 ask_valid_ipv4() { ask_valid "$1" "$2" "$3" valid_ipv4 "IPv4 格式无效。"; }
 ask_valid_host() { ask_valid "$1" "$2" "$3" valid_host "地址格式无效。"; }
@@ -88,33 +92,40 @@ ask_valid_name() { ask_valid "$1" "$2" "$3" valid_name "名称只允许字母、
 ask_secret() {
   local title=$1 prompt=$2 out
   if has_whiptail; then
-    out=$(whiptail --title "$title" --passwordbox "$prompt" 10 72 3>&1 1>&2 2>&3) || return 1
+    out=$(whiptail --title "$title" --ok-button "确定" --cancel-button "返回" --passwordbox "$prompt" 0 0 3>&1 1>&2 2>&3) || return 20
   else
-    read -r -s -p "$prompt: " out; printf '\n' >&2
+    read -r -s -p "$prompt（:menu 返回）: " out || return 20
+    printf '\n' >&2
   fi
+  [[ $out != :menu ]] || return 20
   printf '%s' "$out"
 }
 run_menu_action() {
   local rc
   set +e
-  ( set -Eeuo pipefail; "$@" )
+  ( set -Eeuo pipefail; trap cleanup EXIT; "$@" )
   rc=$?
   set -e
-  if ((rc != 0)); then warn "当前操作未完成（错误码 $rc），已安全返回主菜单。"; fi
+  if ((rc != 0 && rc != 20)); then warn "当前操作未完成（错误码 $rc），已返回菜单，请查看上方原因。"; fi
   return 0
 }
 confirm() {
   local prompt=$1
-  if has_whiptail; then whiptail --title "$APP_NAME" --yesno "$prompt" 12 76; return; fi
-  local ans; read -r -p "$prompt [y/N]: " ans; [[ $ans =~ ^[Yy]$ ]]
+  if has_whiptail; then whiptail --title "$APP_NAME" --yes-button "确认" --no-button "取消" --defaultno --yesno "$prompt" 0 0; return; fi
+  local ans; read -r -p "$prompt [y/N]: " ans || return 1; [[ $ans =~ ^[Yy]$ ]]
 }
 choose() {
   local title=$1 prompt=$2; shift 2
-  if has_whiptail; then whiptail --title "$title" --menu "$prompt" 20 78 12 "$@" 3>&1 1>&2 2>&3; return; fi
+  if has_whiptail; then
+    whiptail --title "$title" --ok-button "确定" --cancel-button "返回" --menu "$prompt" 0 0 0 "$@" 3>&1 1>&2 2>&3 || return 20
+    return 0
+  fi
   local args=("$@") i
   printf '\n%s\n' "$prompt" >&2
   for ((i=0; i<${#args[@]}; i+=2)); do printf '  %s) %s\n' "${args[i]}" "${args[i+1]}" >&2; done
-  local choice; read -r -p "请选择: " choice; printf '%s' "$choice"
+  local choice; read -r -p "请选择（:menu 返回）: " choice || return 20
+  [[ $choice != :menu ]] || return 20
+  printf '%s' "$choice"
 }
 
 write_env() {
@@ -157,7 +168,11 @@ os_check() {
   source /etc/os-release
   case "${ID:-}:${VERSION_ID:-}" in
     debian:12|debian:13|ubuntu:22.04|ubuntu:24.04) ;;
-    *) die "支持 Debian 12/13、Ubuntu 22.04/24.04；当前是 ${PRETTY_NAME:-unknown}。" ;;
+    ubuntu:26.04|ubuntu:26.10)
+      warn "Ubuntu $VERSION_ID 为实验性兼容，尚未完成真实 VPS 集成验证。"
+      confirm "建议先创建 VPS 快照；是否继续实验性安装？" || die "已取消安装，未安装依赖或修改服务。"
+      ;;
+    *) die "支持 Debian 12/13、Ubuntu 22.04/24.04；26.04/26.10 需确认实验性安装；当前是 ${PRETTY_NAME:-unknown}。" ;;
   esac
   case "$(uname -m)" in x86_64|aarch64|arm64) ;; *) die "不支持的架构：$(uname -m)" ;; esac
 }
@@ -199,7 +214,7 @@ make_backup() {
   local stamp target items=()
   stamp=$(date +%Y%m%d-%H%M%S); target="$BACKUP_DIR/hy2m-$stamp.tar.gz"
   mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
-  for p in "$STATE_DIR" "$HYSTERIA_DIR" /etc/systemd/system/hy2m-direct.service /etc/systemd/system/hy2m-isp*.service; do [[ ! -e $p ]] || items+=("${p#/}"); done
+  for p in "$STATE_DIR" "$HYSTERIA_DIR" "$SERVICE_DIR/hy2m-direct.service" "$SERVICE_DIR"/hy2m-isp*.service; do [[ ! -e $p ]] || items+=("${p#/}"); done
   if ((${#items[@]})); then (cd / && tar -czf "$target" "${items[@]}"); chmod 600 "$target"; ok "备份：$target"; fi
 }
 
@@ -323,7 +338,7 @@ EOF
 
 write_service() {
   local service=$1 description=$2 config=$3
-  cat >"/etc/systemd/system/$service" <<EOF
+  cat >"$SERVICE_DIR/$service" <<EOF
 [Unit]
 Description=$description
 After=network-online.target
@@ -343,7 +358,7 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
 EOF
   if ! is_restricted_container; then
-    cat >>"/etc/systemd/system/$service" <<EOF
+    cat >>"$SERVICE_DIR/$service" <<EOF
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
@@ -351,9 +366,9 @@ ReadOnlyPaths=$HYSTERIA_DIR
 ReadWritePaths=/var/lib/hysteria
 EOF
   else
-    printf '# Filesystem namespace hardening omitted: restricted container blocks CLONE_NEWNS.\n' >>"/etc/systemd/system/$service"
+    printf '# Filesystem namespace hardening omitted: restricted container blocks CLONE_NEWNS.\n' >>"$SERVICE_DIR/$service"
   fi
-  cat >>"/etc/systemd/system/$service" <<EOF
+  cat >>"$SERVICE_DIR/$service" <<EOF
 Nice=-5
 LimitNOFILE=1048576
 Restart=on-failure
@@ -402,7 +417,9 @@ EOF
 
 start_checked() {
   local service=$1 port=$2
-  systemctl daemon-reload; systemctl enable "$service" >/dev/null; systemctl restart "$service"
+  systemctl daemon-reload || return 1
+  systemctl enable "$service" >/dev/null || return 1
+  systemctl restart "$service" || return 1
   local i; for i in $(seq 1 20); do
     if systemctl is-active --quiet "$service" && ss -lunH | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then return 0; fi
     sleep 1
@@ -437,13 +454,78 @@ create_direct() {
   install -o root -g hysteria -m 640 "$tmp" "$config"
   printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0#HY2-Direct\n' "$auth" "$DOMAIN" "$public_port" "$DOMAIN" >"$uri_file"; chmod 600 "$uri_file"
   write_service "$service" "HY2 Manager Direct Node" "$config"; open_firewall "$listen_port" udp
-  if ! start_checked "$service" "$listen_port"; then systemctl disable --now "$service" >/dev/null 2>&1 || true; rm -f "$config" "/etc/systemd/system/$service" "$uri_file"; die "直连节点启动失败，已回滚。"; fi
+  if ! start_checked "$service" "$listen_port"; then systemctl disable --now "$service" >/dev/null 2>&1 || true; rm -f "$config" "$SERVICE_DIR/$service" "$uri_file"; close_firewall "$listen_port" udp; die "直连节点启动失败，已回滚。"; fi
   save_node direct direct HY2-Direct "$listen_port" "$public_port" "$service" "$config" "$uri_file" "$mode"
   if [[ $mode == nat ]]; then warn "请确认服务商控制台已有：公网 UDP $public_port → 内部 UDP $listen_port"; fi
   ok "直连节点已创建。"
 }
 
+# Parse pasted credentials as data, never as shell code; the argument is a file path.
+parse_socks_file() {
+  local parsed
+  parsed=$(python3 - "$1" <<'PY'
+import ipaddress, re, sys
+from urllib.parse import urlsplit, unquote
+sys.stdout.reconfigure(newline='\n')
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        raw = f.read().rstrip('\n')
+    if not raw.isprintable():
+        raise ValueError()
+    if '://' in raw:
+        u = urlsplit(raw)
+        if u.scheme not in ('socks5', 'socks5h') or u.path not in ('', '/') or u.query or u.fragment:
+            raise ValueError()
+        if re.search(r'%(?![0-9a-fA-F]{2})', raw):
+            raise ValueError()
+        host, port = u.hostname, u.port
+        user = unquote(u.username or '', errors='strict')
+        password = unquote(u.password or '', errors='strict')
+    else:
+        host, port, user, password = raw.split(':', 3)
+        port = int(port)
+    if not host or not port or not 1 <= port <= 65535:
+        raise ValueError()
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', s) for s in host.split('.')):
+            raise ValueError()
+    if ':' in user or not all(v and v.isprintable() and len(v.encode('utf-8')) <= 255 for v in (user, password)):
+        raise ValueError()
+    print(host, port, user, password, sep='\n')
+except (ValueError, TypeError, OSError):
+    # Never include input credentials in errors.
+    sys.exit(1)
+PY
+  ) || return 1
+  local fields=()
+  mapfile -t fields <<<"$parsed"
+  ((${#fields[@]} == 4)) || return 1
+  SOCKS_HOST=${fields[0]}; SOCKS_PORT=${fields[1]}; SOCKS_USER=${fields[2]}; SOCKS_PASS=${fields[3]}
+}
+
 read_socks() {
+  local mode raw tmp
+  while true; do
+    mode=$(choose "添加 / 更换 ISP" "选择输入方式；代理信息不会出现在首页" 1 "粘贴整条代理信息（隐藏输入）" 2 "分别填写地址、端口、账号和密码" 0 "返回") || return $?
+    case $mode in
+      0) return 20 ;;
+      2) read_socks_fields; return $? ;;
+      1)
+        tmp=$(mktemp); cleanup_files+=("$tmp")
+        while true; do
+          raw=$(ask_secret "粘贴 ISP" "支持 socks5://用户:密码@地址:端口 或 地址:端口:用户:密码；URL 特殊字符需百分号编码") || return $?
+          printf '%s' "$raw" >"$tmp"; unset raw
+          if parse_socks_file "$tmp"; then rm -f "$tmp"; return 0; fi
+          warn "格式无效，需要有效地址、端口及非空账号密码；也可返回后分别填写。"
+        done ;;
+      *) warn "请选择列出的选项。" ;;
+    esac
+  done
+}
+
+read_socks_fields() {
   SOCKS_HOST=$(ask_valid_host "ISP SOCKS5" "SOCKS5 地址（IP 或域名）" "") || return $?
   SOCKS_PORT=$(ask_valid_port "ISP SOCKS5" "SOCKS5 端口" "") || return $?
   while true; do
@@ -535,7 +617,7 @@ create_isp() {
   install -o root -g hysteria -m 640 "$tmp" "$config"
   printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0#%s\n' "$auth" "$DOMAIN" "$public_port" "$DOMAIN" "$name" >"$uri_file"; chmod 600 "$uri_file"
   write_service "$service" "HY2 Manager ISP Full Node $index" "$config"; open_firewall "$listen_port" udp
-  if ! start_checked "$service" "$listen_port"; then systemctl disable --now "$service" >/dev/null 2>&1 || true; rm -f "$config" "/etc/systemd/system/$service" "$uri_file"; die "ISP 节点启动失败，已回滚。"; fi
+  if ! start_checked "$service" "$listen_port"; then systemctl disable --now "$service" >/dev/null 2>&1 || true; rm -f "$config" "$SERVICE_DIR/$service" "$uri_file"; close_firewall "$listen_port" udp; die "ISP 节点启动失败，已回滚。"; fi
   save_node "$id" isp "$name" "$listen_port" "$public_port" "$service" "$config" "$uri_file" "$mode"
   printf 'SOCKS_EXIT_IP=%q\nSOCKS_UDP=%q\n' "$SOCKS_EXIT_IP" "$SOCKS_UDP" >>"$NODE_DIR/$id.env"
   if [[ $mode == nat ]]; then warn "请确认服务商控制台已有：公网 UDP $public_port → 内部 UDP $listen_port"; fi
@@ -546,12 +628,9 @@ create_isp() {
 
 replace_isp() {
   load_manager
-  local id f old_name old_listen old_public old_service old_config old_uri old_mode auth outbound tmp backup
-  while true; do
-    id=$(ask "更换 ISP" "节点 ID（例如 isp1）" "isp1") || return $?
-    if [[ $id =~ ^isp[0-9]+$ && -r $NODE_DIR/$id.env ]]; then break; fi
-    warn "只能选择已存在的 ISP 节点，请重新输入。"
-  done
+  local id=${1:-} f old_name old_listen old_public old_service old_config old_uri old_mode auth outbound tmp backup
+  [[ -n $id ]] || id=$(select_node isp) || return $?
+  [[ $id =~ ^isp[0-9]+$ && -r $NODE_DIR/$id.env ]] || die "只能选择已存在的 ISP 节点。"
   f="$NODE_DIR/$id.env"
   # shellcheck disable=SC1090
   source "$f"
@@ -567,7 +646,7 @@ replace_isp() {
   outbound="isp_all_${id#isp}"; tmp=$(mktemp); backup=$(mktemp); cleanup_files+=("$tmp" "$backup")
   render_isp_config "$old_listen" "$auth" "$outbound" >"$tmp"; cp -a "$old_config" "$backup"
   install -o root -g hysteria -m 640 "$tmp" "$old_config"
-  if ! systemctl restart "$old_service" || ! start_checked "$old_service" "$old_listen"; then
+  if ! start_checked "$old_service" "$old_listen"; then
     warn "新 ISP 配置启动失败，恢复旧配置。"; install -o root -g hysteria -m 640 "$backup" "$old_config"; systemctl restart "$old_service" || true; die "更换失败，旧配置已恢复。"
   fi
   save_node "$id" isp "$old_name" "$old_listen" "$old_public" "$old_service" "$old_config" "$old_uri" "$old_mode"
@@ -575,6 +654,105 @@ replace_isp() {
   unset SOCKS_PASS
   ok "$old_name 已更换 ISP；HY2 链接和密码保持不变。"
 }
+
+recorded_port_free() {
+  local port=$1 field=$2 except=${3:-} f
+  shopt -s nullglob
+  for f in "$NODE_DIR"/*.env; do
+    [[ $f != "$NODE_DIR/$except.env" ]] || continue
+    if grep -Fxq "$field=$port" "$f"; then return 1; fi
+  done
+  return 0
+}
+
+change_node_port() (
+  load_manager
+  # Subshell-scoped (not function-local): Bash may unwind locals before an
+  # EXIT trap caused by errexit, and rollback must still see this state.
+  id=${1:-}; new_listen=""; new_public=""; old_listen=""; old_public=""; work=""
+  changed=0; committed=0; new_rule=0
+  [[ -n $id ]] || id=$(select_node) || return $?
+  [[ $id =~ ^(direct|isp[0-9]+)$ ]] || die "无效节点。"
+  load_node "$id"
+  [[ $CONFIG == "$HYSTERIA_DIR/$id.yaml" && $URI_FILE == "$EXPORT_DIR/hy2-$id.txt" ]] || die "仅支持管理器标准路径下的节点，未修改配置。"
+  old_listen=$LISTEN_PORT; old_public=$PUBLIC_PORT
+  while true; do
+    new_listen=$(ask_valid_port "修改 $NAME" "内部 UDP 端口" "$old_listen") || return $?
+    if [[ $new_listen == "$old_listen" ]] || { port_free "$new_listen" udp && recorded_port_free "$new_listen" LISTEN_PORT "$id"; }; then break; fi
+    warn "该端口被服务或其他节点占用。"
+  done
+  new_public=$new_listen
+  if [[ $NETWORK_MODE == nat ]]; then
+    while true; do
+      new_public=$(ask_valid_port "NAT 映射" "公网 UDP 端口（还需手动修改服务商映射）" "$old_public") || return $?
+      recorded_port_free "$new_public" PUBLIC_PORT "$id" && break
+      warn "该公网端口已被其他节点记录。"
+    done
+  fi
+  if [[ $new_listen == "$old_listen" && $new_public == "$old_public" ]]; then ok "端口未改变。"; return 0; fi
+  confirm "将 $NAME 端口 $old_listen/$old_public 改为 $new_listen/$new_public（内部/公网）？可能短暂断连，客户端需更新链接。" || return 0
+  work=$(mktemp -d "$STATE_DIR/.port-change.XXXXXX")
+  # Called by EXIT/INT/TERM rather than a direct function invocation.
+  # shellcheck disable=SC2317
+  port_change_cleanup() {
+    local rc=$? restored=1
+    trap - EXIT INT TERM
+    if ((changed && !committed)); then
+      install -o root -g hysteria -m 640 "$work/config.before" "$CONFIG" || restored=0
+      install -o root -g root -m 600 "$work/uri.before" "$URI_FILE" || restored=0
+      install -o root -g root -m 600 "$work/state.before" "$NODE_DIR/$id.env" || restored=0
+      if [[ $new_listen != "$old_listen" ]]; then start_checked "$SERVICE" "$old_listen" || restored=0; fi
+      if ((new_rule)); then close_firewall "$new_listen" udp || restored=0; fi
+      if ((restored)); then warn "修改未完成，已恢复旧配置和端口。"; else warn "自动恢复未完成，保留备份：$work"; rc=1; fi
+    fi
+    if ((restored)); then rm -rf -- "$work"; fi
+    cleanup
+    exit "$rc"
+  }
+  trap port_change_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cp -p "$CONFIG" "$work/config.before"
+  cp -p "$URI_FILE" "$work/uri.before"
+  cp -p "$NODE_DIR/$id.env" "$work/state.before"
+  python3 - "$work" "$old_listen" "$new_listen" "$new_public" <<'PY'
+from pathlib import Path
+import re, sys
+from urllib.parse import urlsplit, urlunsplit
+root, old, new, public = Path(sys.argv[1]), *sys.argv[2:]
+config = (root / 'config.before').read_text(encoding='utf-8')
+config, count = re.subn(r'^listen: :' + re.escape(old) + r'[ \t]*$', 'listen: :' + new, config, flags=re.M)
+if count != 1:
+    raise SystemExit('不支持的监听配置，未修改原文件')
+uri = urlsplit((root / 'uri.before').read_text(encoding='utf-8').strip())
+if uri.scheme != 'hysteria2' or not uri.hostname or not uri.username:
+    raise SystemExit('无法识别节点链接，未修改原文件')
+authority = uri.netloc.rsplit(':', 1)[0] + ':' + public
+state = (root / 'state.before').read_text(encoding='utf-8')
+for field, value in [('LISTEN_PORT', new), ('PUBLIC_PORT', public)]:
+    state, count = re.subn(r'^' + field + r'=.*$', field + '=' + value, state, flags=re.M)
+    if count != 1:
+        raise SystemExit('节点状态字段无效，未修改原文件')
+(root / 'config.new').write_text(config, encoding='utf-8', newline='\n')
+(root / 'uri.new').write_text(urlunsplit(uri._replace(netloc=authority)) + '\n', encoding='utf-8', newline='\n')
+(root / 'state.new').write_text(state, encoding='utf-8', newline='\n')
+PY
+  changed=1
+  if [[ $new_listen != "$old_listen" ]]; then
+    if ! grep -Fxq "$new_listen/udp" "$FIREWALL_STATE" 2>/dev/null; then new_rule=1; fi
+    open_firewall "$new_listen" udp
+  fi
+  install -o root -g hysteria -m 640 "$work/config.new" "$CONFIG"
+  install -o root -g root -m 600 "$work/uri.new" "$URI_FILE"
+  if [[ $new_listen != "$old_listen" ]]; then
+    start_checked "$SERVICE" "$new_listen" || die "新端口启动检查失败。"
+  fi
+  install -o root -g root -m 600 "$work/state.new" "$NODE_DIR/$id.env"
+  committed=1
+  if [[ $new_listen != "$old_listen" ]]; then close_firewall "$old_listen" udp || warn "旧防火墙规则清理失败，请检查。"; fi
+  [[ $NETWORK_MODE != nat ]] || warn "请修改服务商映射：公网 UDP $new_public → 内部 UDP $new_listen。"
+  ok "端口已更新，密码及 ISP 凭据保持不变，请重新导入节点链接。"
+)
 
 show_managed_node() {
   local f=$1 uri
@@ -645,12 +823,10 @@ diagnose() {
 }
 
 remove_node() {
-  load_manager; local id f
-  while true; do
-    id=$(ask "删除节点" "节点 ID（例如 direct、isp1）" "") || return $?
-    f="$NODE_DIR/$id.env"; [[ -r $f ]] && break
-    warn "节点不存在，请重新输入。"
-  done
+  load_manager; local id=${1:-} f
+  [[ -n $id ]] || id=$(select_node) || return $?
+  [[ $id =~ ^(direct|isp[0-9]+)$ ]] || die "无效节点。"
+  f="$NODE_DIR/$id.env"; [[ -r $f ]] || die "节点不存在。"
   if [[ $id == direct ]]; then
     shopt -s nullglob
     local isp_nodes=("$NODE_DIR"/isp*.env)
@@ -659,24 +835,29 @@ remove_node() {
   unset SERVICE CONFIG URI_FILE LISTEN_PORT
   # shellcheck disable=SC1090
   source "$f"
-  confirm "确定删除 $id？不会删除 SSH。" || return
-  systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true; rm -f "/etc/systemd/system/$SERVICE" "$CONFIG" "$URI_FILE" "$f"; close_firewall "$LISTEN_PORT" udp; systemctl daemon-reload
+  confirm "确定删除 ${NAME:-$id}（$id，公网端口 $PUBLIC_PORT）？此节点链接将失效，不影响 SSH。" || return 0
+  systemctl disable --now "$SERVICE" || die "停止节点失败，未删除配置。"
+  rm -f "$SERVICE_DIR/$SERVICE" "$CONFIG" "$URI_FILE" "$f"; close_firewall "$LISTEN_PORT" udp; systemctl daemon-reload
   ok "节点 $id 已删除。"
 }
 
 uninstall_all() {
-  [[ -r $MANAGER_STATE ]] || die "未检测到安装状态。"; confirm "完整卸载本管理器创建的节点？SSH 和其他服务不会被修改。" || return
+  [[ -r $MANAGER_STATE ]] || die "未检测到安装状态。"; confirm "完整卸载本管理器创建的节点？SSH 和其他服务不会被修改。" || return 0
   make_backup; local f
   shopt -s nullglob
   for f in "$NODE_DIR"/*.env; do
     unset SERVICE CONFIG URI_FILE LISTEN_PORT
     # shellcheck disable=SC1090
     source "$f"
-    systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true; rm -f "/etc/systemd/system/$SERVICE" "$CONFIG" "$URI_FILE"; close_firewall "$LISTEN_PORT" udp
+    systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true; rm -f "$SERVICE_DIR/$SERVICE" "$CONFIG" "$URI_FILE"; close_firewall "$LISTEN_PORT" udp
   done
   if [[ -r $FIREWALL_STATE ]]; then while IFS=/ read -r port proto; do close_firewall "$port" "$proto"; done < <(cp "$FIREWALL_STATE" /dev/stdout); fi
   systemctl daemon-reload; rm -rf "$STATE_DIR" "$HYSTERIA_DIR" "$EXPORT_DIR"; rm -f /etc/letsencrypt/renewal-hooks/deploy/hy2-manager-copy.sh
-  rm -f /usr/local/sbin/hy2-manager /usr/local/bin/hy2-manager; rm -rf "$APP_DIR"
+  local shortcut
+  for shortcut in "$SBIN_DIR/hy2" "$BIN_DIR/hy2"; do
+    if [[ -L $shortcut && $(readlink "$shortcut") == "$APP_DIR/hy2-manager" ]]; then rm -f "$shortcut"; fi
+  done
+  rm -f "$SBIN_DIR/hy2-manager" "$BIN_DIR/hy2-manager"; rm -rf "$APP_DIR"
   ok "卸载完成。系统证书账户、网络优化和备份被保留，避免影响其他程序。"
 }
 
@@ -743,29 +924,172 @@ initial_install() {
   rm -f "$INSTALL_SESSION"
   log "创建 HY2 直连节点……"; create_direct
   if confirm "现在添加 ISP SOCKS5 全局节点？"; then create_isp; fi
-  ok "安装完成。运行 hy2-manager 查看菜单。"
+  ok "安装完成。运行 hy2 查看菜单（旧命令 hy2-manager 仍可使用）。"
 }
 
 install_self() {
-  require_root; install -d -o root -g root -m 755 "$APP_DIR"; install -o root -g root -m 755 "$0" "$APP_DIR/hy2-manager"; ln -sfn "$APP_DIR/hy2-manager" /usr/local/sbin/hy2-manager; ln -sfn /usr/local/sbin/hy2-manager /usr/local/bin/hy2-manager
-  ok "管理器已安装：运行 sudo hy2-manager"
+  require_root
+  local shortcut
+  for shortcut in "$SBIN_DIR/hy2" "$BIN_DIR/hy2"; do
+    if [[ -e $shortcut || -L $shortcut ]]; then
+      [[ -L $shortcut && $(readlink "$shortcut") == "$APP_DIR/hy2-manager" ]] || die "$shortcut 已被其他程序占用，未覆盖。"
+    fi
+  done
+  install -d -o root -g root -m 755 "$APP_DIR" "$SBIN_DIR" "$BIN_DIR"
+  if [[ ! $0 -ef $APP_DIR/hy2-manager ]]; then install -o root -g root -m 755 "$0" "$APP_DIR/hy2-manager"; fi
+  ln -sfn "$APP_DIR/hy2-manager" "$SBIN_DIR/hy2-manager"
+  ln -sfn "$APP_DIR/hy2-manager" "$BIN_DIR/hy2-manager"
+  ln -sfn "$APP_DIR/hy2-manager" "$SBIN_DIR/hy2"
+  ln -sfn "$APP_DIR/hy2-manager" "$BIN_DIR/hy2"
+  ok "管理器已安装：输入 hy2 即可打开，旧命令仍有效。"
 }
 
-main_menu() {
+pause_menu() {
+  if is_tty; then read -r -p "按 Enter 返回……" _ || true; fi
+  return 0
+}
+menu_action() { run_menu_action "$@"; pause_menu; }
+
+service_label() {
+  local state
+  state=$(systemctl is-active "$1" 2>/dev/null) || true
+  case $state in active) printf '运行中' ;; activating) printf '启动中' ;; failed) printf '故障' ;; inactive) printf '已停止' ;; *) printf '未知' ;; esac
+}
+node_brief() (
+  # Isolate state variables from the caller and never print authentication data.
+  # shellcheck disable=SC1090
+  source "$1"
+  printf '%s | %s | UDP %s' "$NAME" "$(service_label "$SERVICE")" "$PUBLIC_PORT"
+)
+certificate_summary() {
+  if command -v hy2-cert-guard >/dev/null 2>&1; then
+    hy2-cert-guard status 2>/dev/null || true
+  elif [[ -r $TLS_DIR/fullchain.pem ]]; then
+    printf '证书到期：'; openssl x509 -in "$TLS_DIR/fullchain.pem" -noout -enddate 2>/dev/null || true
+    printf '未安装证书守护；可在证书菜单查看续期定时器。\n'
+  else printf '证书：尚无可读状态\n'; fi
+}
+dashboard() {
+  local f count=0
+  printf 'HY2 中文管理面板 | %s\n' "$APP_VERSION"
+  if load_manager_optional; then printf '域名：%s | 网络：%s\n' "$DOMAIN" "$NETWORK_MODE"; fi
+  shopt -s nullglob
+  for f in "$NODE_DIR"/*.env; do node_brief "$f"; printf '\n'; count=$((count+1)); done
+  if [[ ! -r $NODE_DIR/direct.env ]] && legacy_direct_available; then
+    printf '现有直连（只读兼容） | %s\n' "$(service_label "$LEGACY_SERVICE")"
+    count=$((count+1))
+  fi
+  ((count > 0)) || printf '尚未创建节点\n'
+  certificate_summary
+  printf '\n运行中仅代表服务状态，不代表客户端/ISP 连通性。\n'
+}
+select_node() {
+  local filter=${1:-all} f id selected i
+  local ids=() options=()
+  shopt -s nullglob
+  for f in "$NODE_DIR"/*.env; do
+    id=${f##*/}; id=${id%.env}
+    [[ $id =~ ^(direct|isp[0-9]+)$ ]] || continue
+    [[ $filter == all || $id == isp* ]] || continue
+    ids+=("$id"); options+=("${#ids[@]}" "$(node_brief "$f")")
+  done
+  ((${#ids[@]})) || { warn "没有可管理的节点。"; return 20; }
+  options+=(0 "返回")
+  while true; do
+    selected=$(choose "选择节点" "选择节点，无需手输 ID" "${options[@]}") || return $?
+    [[ $selected != 0 ]] || return 20
+    for ((i=0; i<${#ids[@]}; i++)); do
+      if [[ $selected == "$((i+1))" ]]; then printf '%s' "${ids[i]}"; return 0; fi
+    done
+    warn "请选择列表中的编号。"
+  done
+}
+node_menu() {
+  local id c prompt
+  local options=()
+  while true; do
+    id=$(select_node) || return 0
+    while [[ -r $NODE_DIR/$id.env ]]; do
+      load_node "$id"
+      prompt=$(node_brief "$NODE_DIR/$id.env")
+      options=(1 "查看详情、链接 / 二维码" 2 "修改端口")
+      [[ $TYPE != isp ]] || options+=(3 "更换 ISP（保留 HY2 链接）")
+      options+=(4 "删除此节点" 0 "返回节点列表")
+      c=$(choose "管理 $NAME" "$prompt" "${options[@]}") || break
+      case $c in
+        0) break ;;
+        1) menu_action show_managed_node "$NODE_DIR/$id.env" ;;
+        2) menu_action change_node_port "$id" ;;
+        3) if [[ $TYPE == isp ]]; then menu_action replace_isp "$id"; else warn "直连节点没有 ISP 凭据。"; fi ;;
+        4) menu_action remove_node "$id" ;;
+        *) warn "请选择列出的选项。" ;;
+      esac
+    done
+  done
+}
+add_node_menu() {
+  local c
+  c=$(choose "添加节点" "先有直连，再添加 ISP；现有节点不会重建" 1 "添加 ISP 节点" 2 "创建 / 补建直连节点" 0 "返回") || return 0
+  case $c in 1) menu_action create_isp ;; 2) menu_action create_direct ;; 0) return 0 ;; *) warn "无效选择。" ;; esac
+}
+certificate_details() {
+  printf '所有管理器节点共用一套证书，不为 ISP 重复申请。\n'
+  certificate_summary
+  systemctl list-timers --all --no-pager certbot.timer hy2-cert-guard.timer || true
+  printf '\n定时器 active 不代表续期成功，请结合续期日志判断。\n'
+  printf '当前开发版暂不提供全局换域名，避免未经验证的迁移中断现有节点。\n'
+}
+certificate_menu() {
   local c
   while true; do
-    c=$(choose "$APP_NAME $APP_VERSION" "请选择操作" 1 "全新安装" 2 "创建/补建 HY2 直连节点" 3 "添加 ISP SOCKS5 全局节点" 4 "更换现有 ISP SOCKS5" 5 "查看节点与二维码" 6 "查看状态" 7 "一键诊断" 8 "删除指定节点" 9 "备份当前配置" 10 "卸载" 0 "退出") || return
+    c=$(choose "域名与证书" "共用一套证书；查看状态不会执行续期" 1 "查看证书 / 续期计划" 2 "查看最近续期日志" 0 "返回") || return 0
     case $c in
-      1) run_menu_action initial_install ;; 2) run_menu_action create_direct ;; 3) run_menu_action create_isp ;; 4) run_menu_action replace_isp ;; 5) run_menu_action show_nodes ;; 6) run_menu_action status_all ;; 7) run_menu_action diagnose ;; 8) run_menu_action remove_node ;; 9) run_menu_action make_backup ;; 10) run_menu_action uninstall_all; [[ -e /usr/local/sbin/hy2-manager ]] || return ;; 0) return ;; *) warn "无效选择。" ;;
+      0) return 0 ;;
+      1) menu_action certificate_details ;;
+      2) menu_action journalctl -u certbot.service -u hy2-cert-guard.service -n 60 --no-pager ;;
+      *) warn "无效选择。" ;;
     esac
-    is_tty && { printf '\n按 Enter 返回菜单……'; read -r; }
+  done
+}
+maintenance_menu() {
+  local c
+  c=$(choose "诊断与备份" "诊断只读，不自动修改系统" 1 "检查节点、证书与网络" 2 "备份配置" 0 "返回") || return 0
+  case $c in 1) menu_action diagnose ;; 2) menu_action make_backup ;; 0) return 0 ;; *) warn "无效选择。" ;; esac
+}
+advanced_menu() {
+  local c
+  c=$(choose "高级设置" "卸载前会备份配置；不会修改 SSH" 1 "查看版本与命令帮助" 2 "卸载本管理器及其节点" 0 "返回") || return 0
+  case $c in 1) menu_action usage ;; 2) menu_action uninstall_all ;; 0) return 0 ;; *) warn "无效选择。" ;; esac
+}
+main_menu() {
+  local c prompt
+  while true; do
+    if [[ ! -r $MANAGER_STATE ]] && ! legacy_direct_available; then
+      c=$(choose "$APP_NAME $APP_VERSION" "尚未安装：系统检查 → 自定义域名 → 证书 → 直连 → 可选 ISP" 1 "开始全新安装" 0 "退出") || return 0
+      case $c in 1) menu_action initial_install ;; 0) return 0 ;; *) warn "无效选择。" ;; esac
+      continue
+    fi
+    prompt=$(dashboard)
+    if [[ ! -r $MANAGER_STATE ]]; then
+      c=$(choose "现有节点（只读兼容）" "$prompt" 1 "查看现有节点" 2 "域名与证书" 0 "退出") || return 0
+      case $c in 1) menu_action show_nodes ;; 2) certificate_menu ;; 0) return 0 ;; *) warn "无效选择。" ;; esac
+      continue
+    fi
+    c=$(choose "HY2 管理面板" "$prompt" 1 "管理节点" 2 "添加节点" 3 "域名与证书" 4 "诊断与备份" 5 "高级设置" 0 "退出") || return 0
+    case $c in
+      1) node_menu ;; 2) add_node_menu ;; 3) certificate_menu ;; 4) maintenance_menu ;; 5) advanced_menu ;; 0) return 0 ;; *) warn "无效选择。" ;;
+    esac
+    [[ -r $MANAGER_STATE ]] || return 0;
   done
 }
 
 usage() {
   cat <<EOF
 $APP_NAME $APP_VERSION
-用法：
+用法（hy2 为快捷入口，普通用户自动请求 sudo 权限）：
+  hy2
+  hy2 status
+  hy2 change-port
   sudo bash hy2-manager install-self
   sudo hy2-manager install
   sudo hy2-manager create-direct
@@ -784,9 +1108,12 @@ EOF
 main() {
   local cmd=${1:-menu}
   case $cmd in -h|--help|help) usage; return ;; version|--version) printf '%s\n' "$APP_VERSION"; return ;; esac
-  require_root
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    require_cmd sudo
+    exec sudo -- bash "$0" "$@"
+  fi
   case $cmd in
-    install-self) install_self ;; install) initial_install ;; create-direct) create_direct ;; add-isp) create_isp ;; replace-isp) replace_isp ;; show) show_nodes ;; status) status_all ;; diagnose) diagnose ;; backup) make_backup ;; remove-node) remove_node ;; uninstall) uninstall_all ;; menu) main_menu ;; *) usage; exit 2 ;;
+    install-self) install_self ;; install) initial_install ;; create-direct) create_direct ;; add-isp) create_isp ;; replace-isp) replace_isp "${2:-}" ;; change-port) change_node_port "${2:-}" ;; show) show_nodes ;; status) status_all ;; diagnose) diagnose ;; backup) make_backup ;; remove-node) remove_node "${2:-}" ;; uninstall) uninstall_all ;; menu) main_menu ;; *) usage; exit 2 ;;
   esac
 }
 

@@ -2,6 +2,8 @@
 # shellcheck disable=SC1090,SC1091,SC2016,SC2034
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
+mkdir -p .tmp
+export TMPDIR="${TMPDIR:-$PWD/.tmp}"
 
 failures=0
 pass() { printf '[PASS] %s\n' "$1"; }

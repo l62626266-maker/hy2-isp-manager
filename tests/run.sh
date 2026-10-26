@@ -3,6 +3,12 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
+# Keep every generated fixture inside the repository by default.
+mkdir -p .tmp
+export TMPDIR="${TMPDIR:-$PWD/.tmp}"
+HY2M_SERVICE_DIR="$(mktemp -d)/systemd"; export HY2M_SERVICE_DIR
+mkdir -p "$HY2M_SERVICE_DIR"
+
 failures=0
 pass() { printf '[PASS] %s\n' "$1"; }
 fail() { printf '[FAIL] %s\n' "$1" >&2; failures=$((failures+1)); }
@@ -47,7 +53,7 @@ source "$STATE_DIR/test.env"
 [[ $(stat -c '%a' "$STATE_DIR/test.env") == 600 ]] && pass "state mode 600" || fail "state mode 600"
 write_env "$MANAGER_STATE" APP_VERSION 'legacy-beta' DOMAIN 'state.example.com' PUBLIC_IP '192.0.2.1' NETWORK_MODE nat CERT_MODE cloudflare
 load_manager
-[[ $APP_VERSION == '0.2.1' && $DOMAIN == 'state.example.com' ]] && pass "legacy APP_VERSION state compatibility" || fail "legacy APP_VERSION state compatibility"
+[[ $APP_VERSION == '0.3.0-dev' && $DOMAIN == 'state.example.com' ]] && pass "legacy APP_VERSION state compatibility" || fail "legacy APP_VERSION state compatibility"
 mkdir -p "$NODE_DIR"; printf 'PUBLIC_PORT=56777\n' >"$NODE_DIR/nat.env"
 if public_port_free 56777; then fail "reject duplicate NAT public port"; else pass "reject duplicate NAT public port"; fi
 check "allow unused NAT public port" public_port_free 56778
@@ -94,13 +100,13 @@ systemctl() { return 0; }
 view_before=$(show_nodes)
 [[ $view_before == *HY2-Direct* && $view_before == *HY2-ISP-Full* ]] && pass "show Direct and ISP independently" || fail "show Direct and ISP independently"
 TEST_CONFIRM=yes
-remove_node <<<'isp1' >/dev/null
+remove_node isp1 >/dev/null
 [[ -r $NODE_DIR/direct.env && ! -e $NODE_DIR/isp1.env ]] && pass "deleting ISP preserves Direct state" || fail "deleting ISP preserves Direct state"
 TEST_CONFIRM=no
 view_after=$(show_nodes)
 [[ $view_after == *HY2-Direct* && $view_after != *HY2-ISP-Full* ]] && pass "Direct remains visible after ISP deletion" || fail "Direct remains visible after ISP deletion"
 save_node isp1 isp HY2-ISP-Full 8443 8443 hy2m-isp1.service "$HYSTERIA_DIR/isp1.yaml" "$EXPORT_DIR/isp1.txt" normal
-if (TEST_CONFIRM=yes; remove_node <<<'direct' >/dev/null 2>&1); then fail "block deleting Direct while ISP exists"; else pass "block deleting Direct while ISP exists"; fi
+if (TEST_CONFIRM=yes; remove_node direct >/dev/null 2>&1); then fail "block deleting Direct while ISP exists"; else pass "block deleting Direct while ISP exists"; fi
 rm -f "$NODE_DIR/direct.env"
 if (show_nodes >/dev/null 2>&1); then fail "reject unsupported ISP-only inventory"; else pass "reject unsupported ISP-only inventory"; fi
 
