@@ -1061,8 +1061,401 @@ advanced_menu() {
   c=$(choose "高级设置" "卸载前会备份配置；不会修改 SSH" 1 "查看版本与命令帮助" 2 "卸载本管理器及其节点" 0 "返回") || return 0
   case $c in 1) menu_action usage ;; 2) menu_action uninstall_all ;; 0) return 0 ;; *) warn "无效选择。" ;; esac
 }
+# ---------------- 节点生命周期 ----------------
+# 0.2 版只有创建/改端口/删除，节点起不来或被人手动停掉后没有任何恢复入口。
+node_service_state() { systemctl is-active "$1" 2>/dev/null || true; }
+
+start_node() {
+  load_manager; local id=${1:-}
+  [[ -n $id ]] || id=$(select_node) || return $?
+  load_node "$id"
+  if [[ $(node_service_state "$SERVICE") == active ]]; then ok "$NAME 已在运行。"; return 0; fi
+  start_checked "$SERVICE" "$LISTEN_PORT" || die "启动失败，已输出最近日志。"
+  ok "$NAME 已启动。"
+}
+
+stop_node() {
+  load_manager; local id=${1:-}
+  [[ -n $id ]] || id=$(select_node) || return $?
+  load_node "$id"
+  if [[ $(node_service_state "$SERVICE") != active ]]; then ok "$NAME 本来就没在运行。"; return 0; fi
+  confirm "停止 $NAME？已连接的客户端会立即断连。" || return 0
+  systemctl stop "$SERVICE" || die "停止失败。"
+  ok "$NAME 已停止；服务仍是开机自启状态，重启后会重新启动。"
+}
+
+restart_node() {
+  load_manager; local id=${1:-}
+  [[ -n $id ]] || id=$(select_node) || return $?
+  load_node "$id"
+  start_checked "$SERVICE" "$LISTEN_PORT" || die "重启失败，已输出最近日志。"
+  ok "$NAME 已重启。"
+}
+
+# ---------------- 交互层：单屏面板 ----------------
+# 约束：
+#   * 只用 bash 内建 + ANSI；中文对齐借用 python3（本脚本本来已依赖 python3）。
+#   * 非 TTY、TERM=dumb、窗口过小、或 HY2M_UI=plain 时，一律退回原有数字菜单，行为逐字节不变。
+UI_MIN_COLS=70
+UI_MIN_ROWS=14
+UI_CERT_TEXT=""
+
+ui_requested() {
+  [[ ${HY2M_UI:-tui} == tui ]] || return 1
+  is_tty || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  [[ ${TERM:-dumb} != dumb ]] || return 1
+  local cols rows
+  cols=$(tput cols 2>/dev/null || printf 80)
+  rows=$(tput lines 2>/dev/null || printf 24)
+  [[ $cols =~ ^[0-9]+$ && $rows =~ ^[0-9]+$ ]] || return 1
+  (( cols >= UI_MIN_COLS && rows >= UI_MIN_ROWS ))
+}
+
+ui_init_colors() {
+  if [[ -n ${NO_COLOR:-} || ${TERM:-dumb} == dumb ]]; then
+    C_RESET=""; C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_DIM=""; C_BOLD=""
+  else
+    C_RESET=$'\033[0m'; C_BLUE=$'\033[1;34m'; C_GREEN=$'\033[1;32m'
+    C_YELLOW=$'\033[1;33m'; C_RED=$'\033[1;31m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  fi
+}
+
+# 画框：argv1=内宽 argv2=标题；stdin 为逐行 "T<TAB>正文" 或 "R<TAB>列1<TAB>列2…"。
+# 宽度计算跳过 ANSI 序列，中文按双宽处理，超宽按显示宽度截断。
+ui_box() {
+  python3 -c '
+import sys, io, re, unicodedata
+sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+ANSI = re.compile("\x1b\\[[0-9;]*m")
+width = int(sys.argv[1]); title = sys.argv[2]
+def cw(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+def dw(s):
+    return sum(cw(c) for c in ANSI.sub("", s))
+def cut(s, n):
+    out, acc, i = [], 0, 0
+    while i < len(s):
+        m = ANSI.match(s, i)
+        if m:
+            out.append(m.group(0)); i = m.end(); continue
+        w = cw(s[i])
+        if acc + w > n:
+            break
+        out.append(s[i]); acc += w; i += 1
+    return "".join(out), acc
+rows = []
+for raw in sys.stdin.read().split("\n"):
+    if raw == "":
+        continue
+    rows.append(raw.split("\t"))
+colw = []
+for parts in rows:
+    if parts[0] != "R":
+        continue
+    for i, c in enumerate(parts[1:]):
+        while len(colw) <= i:
+            colw.append(0)
+        colw[i] = max(colw[i], dw(c))
+t = "─ " + title + " "
+fill = max(0, width + 2 - dw(t))
+out = ["┌" + t + "─" * fill + "┐"]
+for parts in rows:
+    kind, cells = parts[0], parts[1:]
+    if kind == "R":
+        line = ""
+        for i, c in enumerate(cells):
+            if i:
+                line += "  "
+            line += c + " " * max(0, colw[i] - dw(c))
+    else:
+        line = cells[0] if cells else ""
+    body, _ = cut(line, width)
+    out.append("│ " + body + " " * max(0, width - dw(body)) + " │")
+out.append("└" + "─" * (width + 2) + "┘")
+sys.stdout.write("\n".join(out) + "\n")
+' "$1" "$2"
+}
+
+ui_enter_screen() { [[ -t 1 ]] || return 0; tput smcup 2>/dev/null || true; tput civis 2>/dev/null || true; ui_home; }
+ui_leave_screen() { [[ -t 1 ]] || return 0; tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true; }
+ui_home() { printf '\033[H\033[2J' >&2; }
+
+# 读单键；方向键归一成 up/down/left/right，Esc 归一成 esc，回车归一成 enter。
+ui_readkey() {
+  local k k2 k3
+  IFS= read -rsn1 k || { printf 'quit'; return 0; }
+  if [[ $k == $'\033' ]]; then
+    k2=""
+    IFS= read -rsn1 -t 0.05 k2 || true
+    if [[ $k2 == '[' ]]; then
+      k3=""
+      IFS= read -rsn1 -t 0.05 k3 || true
+      case $k3 in A) printf 'up' ;; B) printf 'down' ;; C) printf 'right' ;; D) printf 'left' ;; *) printf 'esc' ;; esac
+      return 0
+    fi
+    printf 'esc'
+    return 0
+  fi
+  if [[ -z $k || $k == $'\r' || $k == $'\n' ]]; then printf 'enter'; return 0; fi
+  printf '%s' "$k"
+}
+
+ui_node_ids() {
+  local f id
+  shopt -s nullglob
+  for f in "$NODE_DIR"/*.env; do
+    id=${f##*/}; id=${id%.env}
+    [[ $id =~ ^(direct|isp[0-9]+)$ ]] || continue
+    printf '%s\n' "$id"
+  done
+}
+
+# 输出 name<TAB>类型<TAB>状态<TAB>内部端口<TAB>公网端口；在子 shell 中读取，避免污染调用方状态。
+ui_node_cells() {
+  local f="$NODE_DIR/$1.env"
+  [[ -r $f ]] || return 1
+  (
+    unset NAME TYPE SERVICE LISTEN_PORT PUBLIC_PORT
+    # shellcheck disable=SC1090
+    source "$f"
+    printf '%s\t%s\t%s\t%s\t%s\n' "${NAME:-$1}" "${TYPE:-unknown}" \
+      "$(service_label "${SERVICE:-}")" "${LISTEN_PORT:-?}" "${PUBLIC_PORT:-?}"
+  )
+}
+
+ui_cert_text() {
+  local f="$TLS_DIR/fullchain.pem" end epoch now days
+  if [[ -r $f ]]; then
+    end=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null) || end=""
+    epoch=$(openssl x509 -in "$f" -noout -checkend 0 >/dev/null 2>&1 && date -d "${end#notAfter=}" +%s 2>/dev/null) || epoch=""
+    if [[ $epoch =~ ^[0-9]+$ ]]; then
+      now=$(date +%s); days=$(( (epoch - now) / 86400 ))
+      if (( days < 0 )); then UI_CERT_TEXT="${C_RED}证书已过期${C_RESET}"
+      elif (( days < 14 )); then UI_CERT_TEXT="${C_YELLOW}证书 ${days} 天${C_RESET}"
+      else UI_CERT_TEXT="${C_GREEN}证书 ${days} 天${C_RESET}"; fi
+      return 0
+    fi
+  fi
+  UI_CERT_TEXT="${C_DIM}证书 未知${C_RESET}"
+}
+
+ui_status_color() {
+  case $1 in
+    *运行中*) printf '%s● %s%s' "$C_GREEN" "$1" "$C_RESET" ;;
+    *故障*) printf '%s● %s%s' "$C_RED" "$1" "$C_RESET" ;;
+    *启动中*) printf '%s● %s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
+    *) printf '%s○ %s%s' "$C_DIM" "$1" "$C_RESET" ;;
+  esac
+}
+
+ui_width() {
+  local cols
+  cols=$(tput cols 2>/dev/null || printf 80)
+  [[ $cols =~ ^[0-9]+$ ]] || cols=80
+  local w=$(( cols - 6 ))
+  (( w > 72 )) && w=72
+  (( w < 40 )) && w=40
+  printf '%s' "$w"
+}
+
+ui_draw_panel() {
+  local sel=$1; shift
+  local -a ids=("$@") body=()
+  local i id mark name type state listen public w
+  ui_init_colors
+  w=$(ui_width)
+  body+=("T	${C_BOLD}HY2 ISP Manager $APP_VERSION${C_RESET}")
+  body+=("T	域名 ${DOMAIN:-未设置}   网络 ${NETWORK_MODE:-未设置}   $UI_CERT_TEXT")
+  body+=("T	")
+  body+=("R	#	节点	状态	内部/公网	类型")
+  for ((i = 0; i < ${#ids[@]}; i++)); do
+    id=${ids[i]}
+    IFS=$'\t' read -r name type state listen public < <(ui_node_cells "$id") || continue
+    mark=' '; (( i == sel )) && mark='>'
+    body+=("R	${mark}$((i + 1))	${name}	$(ui_status_color "$state")	${listen}/${public}	${type}")
+  done
+  ((${#ids[@]})) || body+=("T	${C_DIM}尚未创建节点，按 a 添加。${C_RESET}")
+  body+=("T	")
+  body+=("T	${C_DIM}↑↓ 选择   Enter 进入   a 添加   c 证书   d 诊断   s 设置   q 退出${C_RESET}")
+  ui_home
+  printf '%s\n' "${body[@]}" | ui_box "$w" "HY2 管理面板" >&2
+}
+
+ui_draw_menu() {
+  local title=$1 prompt=$2 sel=$3; shift 3
+  local -a labels=("$@") body=()
+  local i mark w
+  ui_init_colors
+  w=$(ui_width)
+  body+=("T	${C_BOLD}${title}${C_RESET}")
+  body+=("T	${C_DIM}${prompt}${C_RESET}")
+  body+=("T	")
+  for ((i = 0; i < ${#labels[@]}; i++)); do
+    mark='  '; (( i == sel )) && mark="${C_GREEN}>${C_RESET} "
+    body+=("T	${mark}${labels[i]}")
+  done
+  body+=("T	")
+  body+=("T	${C_DIM}↑↓ 移动   Enter 确定   Esc 返回${C_RESET}")
+  ui_home
+  printf '%s\n' "${body[@]}" | ui_box "$w" "$APP_NAME" >&2
+}
+
+# ui_menu <标题> <说明> "键|说明" …；选中返回键，Esc/q 返回 20。
+ui_menu() {
+  local title=$1 prompt=$2; shift 2
+  local -a entries=("$@") keys=() labels=()
+  local e sel=0 key i
+  for e in "${entries[@]}"; do
+    keys+=("${e%%|*}")
+    labels+=("${e#*|}")
+  done
+  ((${#keys[@]})) || return 20
+  while true; do
+    ui_draw_menu "$title" "$prompt" "$sel" "${labels[@]}"
+    key=$(ui_readkey)
+    case $key in
+      up|k) if (( sel > 0 )); then sel=$((sel - 1)); fi ;;
+      down|j) if (( sel < ${#keys[@]} - 1 )); then sel=$((sel + 1)); fi ;;
+      enter) printf '%s' "${keys[sel]}"; return 0 ;;
+      esc|quit|q|Q) return 20 ;;
+      *)
+        for ((i = 0; i < ${#keys[@]}; i++)); do
+          if [[ $key == "${keys[i]}" ]]; then printf '%s' "${keys[i]}"; return 0; fi
+        done
+        ;;
+    esac
+  done
+}
+
+# 离开面板执行动作，输出完整可见，按键后回到面板。
+ui_run() {
+  ui_leave_screen
+  run_menu_action "$@"
+  if is_tty; then printf '\n按任意键返回面板……' >&2; IFS= read -rsn1 _ || true; fi
+  ui_enter_screen
+}
+
+ui_node_actions() {
+  local id=$1 choice name type
+  local -a items
+  while [[ -r $NODE_DIR/$id.env ]]; do
+    IFS=$'\t' read -r name type _ < <(ui_node_cells "$id") || { name=$id; type=unknown; }
+    items=("1|查看详情、链接 / 二维码" "2|启动节点" "3|停止节点" "4|重启节点" "5|修改端口")
+    [[ $type != isp ]] || items+=("6|更换 ISP（保留 HY2 链接）")
+    items+=("0|返回节点列表")
+    choice=$(ui_menu "管理 $name" "选择要执行的操作" "${items[@]}") || return 0
+    case $choice in
+      0) return 0 ;;
+      1) ui_run show_managed_node "$NODE_DIR/$id.env" ;;
+      2) ui_run start_node "$id" ;;
+      3) ui_run stop_node "$id" ;;
+      4) ui_run restart_node "$id" ;;
+      5) ui_run change_node_port "$id" ;;
+      6) ui_run replace_isp "$id" ;;
+    esac
+  done
+  return 0
+}
+
+ui_add_menu() {
+  local c
+  c=$(ui_menu "添加节点" "先有直连，再添加 ISP；现有节点不会重建" \
+    "1|添加 ISP 节点" "2|创建 / 补建直连节点" "0|返回") || return 0
+  case $c in
+    1) ui_run create_isp ;;
+    2) ui_run create_direct ;;
+    0) return 0 ;;
+  esac
+}
+
+ui_cert_menu() {
+  local c
+  while true; do
+    c=$(ui_menu "域名与证书" "共用一套证书；查看状态不会执行续期" \
+      "1|查看证书 / 续期计划" "2|查看最近续期日志" "0|返回") || return 0
+    case $c in
+      0) return 0 ;;
+      1) ui_run certificate_details ;;
+      2) ui_run journalctl -u certbot.service -u hy2-cert-guard.service -n 60 --no-pager ;;
+    esac
+  done
+}
+
+ui_diag_menu() {
+  local c
+  c=$(ui_menu "诊断与备份" "诊断只读，不自动修改系统" \
+    "1|检查节点、证书与网络" "2|备份配置" "0|返回") || return 0
+  case $c in
+    1) ui_run diagnose ;;
+    2) ui_run make_backup ;;
+    0) return 0 ;;
+  esac
+}
+
+ui_advanced_menu() {
+  local c
+  c=$(ui_menu "高级设置" "卸载前会备份配置；不会修改 SSH" \
+    "1|查看版本与命令帮助" "2|卸载本管理器及其节点" "0|返回") || return 0
+  case $c in
+    1) ui_run usage ;;
+    2) ui_run uninstall_all ;;
+    0) return 0 ;;
+  esac
+}
+
+ui_main_loop() {
+  local -a ids=()
+  local sel=0 key id i
+  ui_init_colors
+  load_manager
+  ui_cert_text
+  ui_enter_screen
+  trap 'ui_leave_screen' EXIT
+  trap 'ui_leave_screen; exit 130' INT
+  trap 'ui_leave_screen; exit 143' TERM
+  while true; do
+    ids=()
+    while IFS= read -r id; do ids+=("$id"); done < <(ui_node_ids)
+    if ((${#ids[@]})) && (( sel >= ${#ids[@]} )); then sel=$(( ${#ids[@]} - 1 )); fi
+    if (( sel < 0 )); then sel=0; fi
+    ui_draw_panel "$sel" ${ids[@]+"${ids[@]}"}
+    key=$(ui_readkey)
+    case $key in
+      q|Q|quit) break ;;
+      up|k) if (( sel > 0 )); then sel=$((sel - 1)); fi ;;
+      down|j) if (( sel < ${#ids[@]} - 1 )); then sel=$((sel + 1)); fi ;;
+      enter)
+        if ((${#ids[@]})); then ui_node_actions "${ids[sel]}"; fi
+        ui_cert_text
+        ;;
+      a|A) ui_add_menu ;;
+      c|C) ui_cert_menu; ui_cert_text ;;
+      d|D) ui_diag_menu ;;
+      s|S) ui_advanced_menu ;;
+      [1-9])
+        i=$((key - 1))
+        if (( i < ${#ids[@]} )); then sel=$i; ui_node_actions "${ids[sel]}"; fi
+        ui_cert_text
+        ;;
+    esac
+    [[ -r $MANAGER_STATE ]] || break
+  done
+  ui_leave_screen
+  trap - EXIT INT TERM
+  trap cleanup EXIT
+  return 0
+}
+
 main_menu() {
   local c prompt
+  if [[ -r $MANAGER_STATE ]] && ui_requested; then
+    ui_main_loop
+    return 0
+  fi
   while true; do
     if [[ ! -r $MANAGER_STATE ]] && ! legacy_direct_available; then
       c=$(choose "$APP_NAME $APP_VERSION" "尚未安装：系统检查 → 自定义域名 → 证书 → 直连 → 可选 ISP" 1 "开始全新安装" 0 "退出") || return 0
