@@ -36,10 +36,15 @@ fixture isp2 10443
 refresh_manager_targets
 [[ $UDP_PORTS == '443 10443' ]]
 printf '[PASS] changed listener port follows node inventory\n'
+printf 'DESIRED_STATE=stopped\nSTOP_BOOT_ID=11111111-1111-1111-1111-111111111111\n' >>"$HY2CG_MANAGER_NODE_DIR/direct.env"
+refresh_manager_targets
+[[ ${EXPECTED_STOP_BOOT[hy2m-direct.service]} == 11111111-1111-1111-1111-111111111111 && ${MANAGED_SERVICE_PORT[hy2m-direct.service]} == 443 ]]
+printf '[PASS] discovered stop intent retains service-to-port association\n'
 AUTO_DISCOVER_MANAGER=0
 SERVICES='hy2m-direct.service'; UDP_PORTS=443
 refresh_manager_targets
 [[ $SERVICES == 'hy2m-direct.service' && $UDP_PORTS == 443 ]]
+[[ ${#EXPECTED_STOP_BOOT[@]} == 0 && ${#MANAGED_SERVICE_PORT[@]} == 0 ]]
 printf '[PASS] explicit opt-out preserves configured targets\n'
 AUTO_DISCOVER_MANAGER=1
 SERVICES='hysteria-server.service hy2m-direct.service'; UDP_PORTS='443 8443'

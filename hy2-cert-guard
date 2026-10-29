@@ -16,6 +16,7 @@ DOMAIN=""; EXPECTED_IPV4=""; LIVE_DIR=""; DEPLOY_CERT=""; DEPLOY_KEY=""
 SERVICES=""; UDP_PORTS=""; WARN_DAYS=30; FAIL_DAYS=14
 AUTO_DISCOVER_MANAGER=1
 CERT_MODE=""
+declare -A EXPECTED_STOP_BOOT=() MANAGED_SERVICE_PORT=()
 passes=0; warnings=0; failures=0; messages=()
 
 if [[ -t 1 ]]; then C_RESET='\033[0m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[1;31m'; C_BLUE='\033[1;34m'; else C_RESET=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_BLUE=''; fi
@@ -50,7 +51,7 @@ trusted_root_file() {
   [[ $owner == 0 && $mode =~ ^[0-7]+$ ]] && (( (8#$mode & 022) == 0 ))
 }
 manager_node_target() (
-  local file=$1 config_dir=$2 id SERVICE="" LISTEN_PORT="" CONFIG=""
+  local file=$1 config_dir=$2 id SERVICE="" LISTEN_PORT="" CONFIG="" DESIRED_STATE=running STOP_BOOT_ID=""
   id=${file##*/}; id=${id%.env}
   [[ $id =~ ^(direct|isp[0-9]+)$ ]] || return 1
   trusted_root_file "$file" || return 1
@@ -63,13 +64,16 @@ manager_node_target() (
   grep -Fxq "  cert: \"$DEPLOY_CERT\"" "$CONFIG" || return 1
   grep -Fxq "  key: \"$DEPLOY_KEY\"" "$CONFIG" || return 1
   grep -Fxq "listen: :$LISTEN_PORT" "$CONFIG" || return 1
-  printf '%s %s\n' "$SERVICE" "$LISTEN_PORT"
+  [[ $DESIRED_STATE == running || $DESIRED_STATE == stopped ]] || return 1
+  [[ -z $STOP_BOOT_ID || $STOP_BOOT_ID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
+  printf '%s %s %s %s\n' "$SERVICE" "$LISTEN_PORT" "$DESIRED_STATE" "${STOP_BOOT_ID:--}"
 )
 refresh_manager_targets() {
   MANAGER_TARGETS=0
+  EXPECTED_STOP_BOOT=(); MANAGED_SERVICE_PORT=()
   [[ $AUTO_DISCOVER_MANAGER == 1 ]] || return 0
   local nodes="${HY2CG_MANAGER_NODE_DIR:-/etc/hy2-isp-manager/nodes}"
-  local configs="${HY2CG_MANAGER_CONFIG_DIR:-/etc/hysteria-hy2m}" unit file target
+  local configs="${HY2CG_MANAGER_CONFIG_DIR:-/etc/hysteria-hy2m}" unit file target port desired boot
   local discovered_services=() discovered_ports=()
   # Manual/mixed deployments keep their explicit configuration untouched.
   [[ -d $nodes && $DEPLOY_CERT == "$configs/tls/fullchain.pem" && $DEPLOY_KEY == "$configs/tls/privkey.pem" ]] || return 0
@@ -77,7 +81,10 @@ refresh_manager_targets() {
   for file in "$nodes"/*.env; do
     [[ -e $file ]] || continue
     target=$(manager_node_target "$file" "$configs") || die "管理器节点状态无法验证：${file##*/}；未执行证书部署。"
-    discovered_services+=("${target%% *}"); discovered_ports+=("${target##* }")
+    read -r unit port desired boot <<<"$target"
+    discovered_services+=("$unit"); discovered_ports+=("$port")
+    MANAGED_SERVICE_PORT[$unit]=$port
+    if [[ $desired == stopped && $boot != - ]]; then EXPECTED_STOP_BOOT[$unit]=$boot; fi
   done
   ((${#discovered_services[@]})) || die "没有可验证的管理器节点，拒绝使用过期服务清单。"
   SERVICES="${discovered_services[*]}"; UDP_PORTS="${discovered_ports[*]}"
@@ -144,7 +151,11 @@ key_pub_hash() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | sha256
 cert_pair_matches() { local a b; a=$(cert_pub_hash "$1") || return 1; b=$(key_pub_hash "$2") || return 1; [[ -n $a && $a == "$b" ]]; }
 cert_fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
 cert_days_left() { local end now; end=$(openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2-) || return 1; [[ -n $end ]] || return 1; end=$(date -d "$end" +%s 2>/dev/null) || return 1; now=$(date +%s); printf '%d' "$(( (end-now) / 86400 ))"; }
-cert_has_domain() { openssl x509 -in "$1" -noout -checkhost "$2" >/dev/null 2>&1; }
+cert_has_domain() {
+  local verdict
+  verdict=$(LC_ALL=C openssl x509 -in "$1" -noout -checkhost "$2" 2>/dev/null) || return 1
+  [[ $verdict == "Hostname $2 does match certificate" ]]
+}
 
 write_result() {
   local state=$1 days=$2 expiry=$3 timer=$4 services=$5 service_details=$6 tmp
@@ -180,6 +191,19 @@ resolve_ipv4() {
   fi
 }
 
+current_boot_id() {
+  local boot
+  read -r boot </proc/sys/kernel/random/boot_id || return 1
+  [[ $boot =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
+  printf '%s' "$boot"
+}
+service_intentionally_stopped() {
+  local boot
+  [[ $2 == inactive && -n ${EXPECTED_STOP_BOOT[$1]:-} ]] || return 1
+  boot=$(current_boot_id) || return 1
+  [[ -n $boot && ${EXPECTED_STOP_BOOT[$1]} == "$boot" ]]
+}
+
 check_all() {
   require_root; load_config
   passes=0; warnings=0; failures=0; messages=()
@@ -212,15 +236,21 @@ check_all() {
   check_challenge_access
 
   local unit enabled active service_summary=()
+  local -A stopped_ports=()
   for unit in $SERVICES; do
     active=$(systemctl is-active "$unit" 2>/dev/null || true); enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     service_summary+=("$unit:$active/$enabled")
-    if [[ $active == active ]]; then pass "$unit 正在运行"; else fail "$unit 未运行（$active）"; services_state=failed; fi
+    if [[ $active == active ]]; then pass "$unit 正在运行"
+    elif service_intentionally_stopped "$unit" "$active"; then
+      pass "$unit 本次开机期间已主动停用"
+      if [[ -n ${MANAGED_SERVICE_PORT[$unit]:-} ]]; then stopped_ports[${MANAGED_SERVICE_PORT[$unit]}]=1; fi
+    else fail "$unit 未运行（$active）"; services_state=failed; fi
     case $enabled in enabled|enabled-runtime|static) pass "$unit 启动状态: $enabled" ;; *) warn "$unit 启动状态: ${enabled:-unknown}" ;; esac
   done
   listeners=$(ss -H -lun 2>/dev/null || true)
   local port
   for port in $UDP_PORTS; do
+    [[ ${stopped_ports[$port]:-0} == 1 ]] && continue
     if awk -v p=":$port" '$4 ~ (p "$" ) {found=1} END{exit !found}' <<<"$listeners"; then pass "UDP $port 正在监听"; else fail "UDP $port 未监听"; services_state=failed; fi
   done
 

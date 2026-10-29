@@ -35,6 +35,7 @@ start_checked() {
   [[ $2 != "${FAIL_PORT:-none}" ]]
 }
 
+restart_unit_checked() { start_checked "$@"; }
 has_whiptail() { return 1; }
 check 'port input is normalized' test "$(ask_valid_port test port '' <<<'00443')" = 443
 if valid_port 18446744073709552059; then exit 1; fi
@@ -57,6 +58,7 @@ set +e
 choose test menu 1 one >/dev/null; rc=$?
 set -e
 check 'dialog Escape maps to cancellation' test "$rc" = 20
+restart_unit_checked() { start_checked "$@"; }
 has_whiptail() { return 1; }
 
 # Noninteractive fixture: paste is parsed from a protected file, not argv/eval.

@@ -95,7 +95,7 @@ run_case() (
   curl() { bad 'unexpected network: curl'; }
   dig() { bad 'unexpected network: dig'; }
   apt-get() { printf 'apt-get %s\n' "$*" >>"$events"; return 0; }
-  openssl() { printf 'mock-public-key\n'; }
+  openssl() { if [[ " $* " == *" -checkhost "* ]]; then printf 'Hostname %s does match certificate\n' "${*: -1}"; else printf 'mock-public-key\n'; fi; }
   certbot() {
     printf 'certbot %s\n' "$*" >>"$events"
     if ((signal_code)); then

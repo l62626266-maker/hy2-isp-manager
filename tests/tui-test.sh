@@ -37,6 +37,7 @@ systemctl() {
   return 0
 }
 confirm() { return 0; }
+current_boot_id() { printf '11111111-1111-1111-1111-111111111111'; }
 start_checked() { printf 'start %s %s\n' "$1" "$2" >>"$tmp/start-calls"; }
 select_node() { printf 'isp1'; }
 

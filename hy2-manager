@@ -201,6 +201,8 @@ load_manager() { [[ -r $MANAGER_STATE ]] || die "尚未安装节点，请先运�
   source <(grep -v '^APP_VERSION=' "$MANAGER_STATE" || true)
 }
 load_node() { local f="$NODE_DIR/$1.env"; [[ -r $f ]] || die "节点不存在：$1"; # shellcheck disable=SC1090
+  DESIRED_STATE=running; STOP_BOOT_ID=""; SOCKS_EXIT_IP=""; SOCKS_UDP=""
+  # shellcheck disable=SC1090
   source "$f"; }
 load_manager_optional() {
   [[ -r $MANAGER_STATE ]] || return 1
@@ -325,12 +327,14 @@ def inventory(base, strict):
     manager = read_env(state / 'manager.env', manager_fields) if (state / 'manager.env').exists() else {}
     if strict and (not manager.get('DOMAIN') or manager.get('NETWORK_MODE') not in ('normal', 'nat')):
         fail('missing or invalid manager state')
-    fields = {'ID','TYPE','NAME','LISTEN_PORT','PUBLIC_PORT','SERVICE','CONFIG','URI_FILE','NETWORK_MODE','SOCKS_EXIT_IP','SOCKS_UDP'}
+    fields = {'ID','TYPE','NAME','LISTEN_PORT','PUBLIC_PORT','SERVICE','CONFIG','URI_FILE','NETWORK_MODE','SOCKS_EXIT_IP','SOCKS_UDP','DESIRED_STATE','STOP_BOOT_ID'}
     result, ports = [], set()
     for file in sorted((state / 'nodes').glob('*.env')):
         if not node_re.fullmatch(file.name): fail('unrecognized node record')
         v = read_env(file, fields); node = file.stem
         if v.get('ID') != node or v.get('SERVICE') != 'hy2m-' + node + '.service': fail('node ID/service mismatch')
+        if v.get('DESIRED_STATE', 'running') not in ('running', 'stopped'): fail('invalid desired state')
+        if v.get('STOP_BOOT_ID') and not re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', v['STOP_BOOT_ID']): fail('invalid boot identity')
         port = v.get('LISTEN_PORT', '')
         if not port.isdecimal() or not 1 <= int(port) <= 65535: fail('invalid listener port')
         if strict:
@@ -903,11 +907,16 @@ _certificate_http() {
   fi
   return 0
 }
+certificate_hostname_matches() {
+  local verdict
+  verdict=$(LC_ALL=C openssl x509 -in "$1" -noout -checkhost "$2" 2>/dev/null) || return 1
+  [[ $verdict == "Hostname $2 does match certificate" ]]
+}
 certificate_valid() {
   local domain=$1 live="$LETSENCRYPT_DIR/live/$1/fullchain.pem"
   valid_domain "$domain" || return 1
   [[ -r $live ]] && openssl x509 -in "$live" -noout -checkend 2592000 >/dev/null 2>&1 &&
-    openssl x509 -in "$live" -noout -checkhost "$domain" >/dev/null 2>&1
+    certificate_hostname_matches "$live" "$domain"
 }
 certificate_cloudflare() {
   # shellcheck disable=SC2031
@@ -961,7 +970,7 @@ for filename in ['fullchain.pem', 'privkey.pem']:
         raise SystemExit('证书来源不在管理的 ACME 目录中')
 PY
   then return 1; fi
-  openssl x509 -in "$live/fullchain.pem" -noout -checkend 0 -checkhost "$domain" >/dev/null 2>&1 || { warn "证书无效或域名不匹配。"; return 1; }
+  (openssl x509 -in "$live/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1 && certificate_hostname_matches "$live/fullchain.pem" "$domain") || { warn "证书无效或域名不匹配。"; return 1; }
   cert_key=$(openssl x509 -in "$live/fullchain.pem" -pubkey -noout) || return 1
   private_key=$(openssl pkey -in "$live/privkey.pem" -pubout) || return 1
   [[ -n $cert_key && $cert_key == "$private_key" ]] || { warn "证书与私钥不匹配。"; return 1; }
@@ -1037,8 +1046,15 @@ _renew_certificate_impl() {
 }
 
 write_service() {
-  local service=$1 description=$2 config=$3
-  cat >"$SERVICE_DIR/$service" <<EOF
+  local tmp rc=0
+  tmp=$(mktemp "$SERVICE_DIR/.unit.XXXXXXXX") || return 1
+  if render_service "$2" "$3" >"$tmp" && install_owned 644 root "$tmp" "$SERVICE_DIR/$1"; then :; else rc=1; fi
+  rm -f -- "$tmp"
+  return "$rc"
+}
+render_service() {
+  local description=$1 config=$2
+  cat <<EOF || return 1
 [Unit]
 Description=$description
 After=network-online.target
@@ -1058,7 +1074,7 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
 EOF
   if ! is_restricted_container; then
-    cat >>"$SERVICE_DIR/$service" <<EOF
+    cat <<EOF || return 1
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
@@ -1066,9 +1082,9 @@ ReadOnlyPaths=$HYSTERIA_DIR
 ReadWritePaths=/var/lib/hysteria
 EOF
   else
-    printf '# Filesystem namespace hardening omitted: restricted container blocks CLONE_NEWNS.\n' >>"$SERVICE_DIR/$service"
+    printf '# Filesystem namespace hardening omitted: restricted container blocks CLONE_NEWNS.\n'
   fi
-  cat >>"$SERVICE_DIR/$service" <<EOF
+  cat <<EOF || return 1
 Nice=-5
 LimitNOFILE=1048576
 IPAccounting=true
@@ -1130,13 +1146,158 @@ start_checked() {
 
 save_node() {
   local id=$1 type=$2 name=$3 listen_port=$4 public_port=$5 service=$6 config=$7 uri_file=$8 mode=$9
-  write_env "$NODE_DIR/$id.env" ID "$id" TYPE "$type" NAME "$name" LISTEN_PORT "$listen_port" PUBLIC_PORT "$public_port" SERVICE "$service" CONFIG "$config" URI_FILE "$uri_file" NETWORK_MODE "$mode"
+  write_env "$NODE_DIR/$id.env" ID "$id" TYPE "$type" NAME "$name" LISTEN_PORT "$listen_port" PUBLIC_PORT "$public_port" SERVICE "$service" CONFIG "$config" URI_FILE "$uri_file" NETWORK_MODE "$mode" DESIRED_STATE "${10:-running}" STOP_BOOT_ID "${11:-}" SOCKS_EXIT_IP "${12:-}" SOCKS_UDP "${13:-}"
+}
+
+# All node mutations share one rollback boundary. Callers hold the mutation lock.
+# Callback state lives in the enclosing node_transaction subshell.
+# shellcheck disable=SC2030,SC2031
+node_transaction() (
+  nt_id=$1; shift
+  [[ $nt_id =~ ^(direct|isp[0-9]+)$ ]] || return 1
+  nt_state="$NODE_DIR/$nt_id.env"; nt_config="$HYSTERIA_DIR/$nt_id.yaml"
+  nt_uri="$EXPORT_DIR/hy2-$nt_id.txt"; nt_service="hy2m-$nt_id.service"
+  nt_unit="$SERVICE_DIR/$nt_service"; nt_new=1; nt_port=""
+  if [[ -e $nt_state ]]; then
+    load_node "$nt_id" || return 1
+    [[ $CONFIG == "$nt_config" && $SERVICE == "$nt_service" ]] || return 1
+    nt_uri=$URI_FILE; nt_port=$LISTEN_PORT; nt_new=0
+  else
+    [[ ! -e $nt_config && ! -e $nt_uri && ! -e $nt_unit ]] || { warn "节点已有未登记文件，拒绝覆盖。"; return 1; }
+  fi
+  transaction_path_safe "$STATE_DIR" "$nt_state" &&
+    transaction_path_safe "$HYSTERIA_DIR" "$nt_config" &&
+    transaction_path_safe "$EXPORT_DIR" "$nt_uri" &&
+    transaction_path_safe "$SERVICE_DIR" "$nt_unit" || return 1
+  nt_active=$(systemctl is-active "$nt_service" 2>/dev/null || true)
+  nt_enabled=$(systemctl is-enabled "$nt_service" 2>/dev/null || true)
+  case $nt_active in active|inactive|failed|unknown) ;; *) warn "服务状态不稳定，未执行修改。"; return 1 ;; esac
+  case $nt_enabled in enabled|disabled|static|indirect|not-found|'') ;; *) warn "服务启用状态不支持安全恢复。"; return 1 ;; esac
+  if ((nt_new)) && [[ $nt_active == active || $nt_enabled == enabled ]]; then return 1; fi
+  nt_work=$(mktemp -d "$STATE_DIR/.node-transaction.XXXXXXXX") || return 1
+  nt_changed=0; nt_committed=0; nt_runtime=0; nt_enable=0; nt_units=0; nt_firewall=""
+  # shellcheck disable=SC2317
+  node_transaction_cleanup() {
+    local rc=$? restored=1
+    trap - EXIT; trap '' INT TERM
+    if ((nt_changed && !nt_committed)); then
+      if ((nt_runtime)); then systemctl stop "$nt_service" || restored=0; fi
+      # Do not remove a configuration while its process may still be running.
+      if ((restored)); then
+        if ((nt_enable && nt_new)); then systemctl disable "$nt_service" >/dev/null 2>&1 || restored=0; fi
+        transaction_restore_file "$nt_work" config "$nt_config" 640 hysteria || restored=0
+        transaction_restore_file "$nt_work" uri "$nt_uri" 600 root || restored=0
+        transaction_restore_file "$nt_work" unit "$nt_unit" 644 root || restored=0
+        transaction_restore_file "$nt_work" node "$nt_state" 600 root || restored=0
+        if ((nt_units)); then systemctl daemon-reload || restored=0; fi
+        if ((nt_enable && !nt_new)); then
+          case $nt_enabled in
+            enabled) systemctl enable "$nt_service" >/dev/null 2>&1 || restored=0 ;;
+            disabled) systemctl disable "$nt_service" >/dev/null 2>&1 || restored=0 ;;
+          esac
+        fi
+        if [[ -n $nt_firewall ]]; then close_firewall "$nt_firewall" udp || restored=0; fi
+        if ((nt_runtime)) && [[ $nt_active == active ]] && ((restored)); then
+          restart_unit_checked "$nt_service" "$nt_port" || restored=0
+        fi
+      fi
+      ((rc != 0)) || rc=1
+    fi
+    if ((restored)); then rm -rf -- "$nt_work"
+    else warn "节点恢复未完成，保留恢复材料：$nt_work"; ((rc != 0)) || rc=1; fi
+    exit "$rc"
+  }
+  trap node_transaction_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  transaction_snapshot_file "$nt_work" node "$nt_state" &&
+    transaction_snapshot_file "$nt_work" config "$nt_config" &&
+    transaction_snapshot_file "$nt_work" uri "$nt_uri" &&
+    transaction_snapshot_file "$nt_work" unit "$nt_unit" || return 1
+  nt_changed=1
+  "$@" || return $?
+  nt_committed=1
+)
+
+current_boot_id() {
+  local boot
+  read -r boot </proc/sys/kernel/random/boot_id || return 1
+  [[ $boot =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
+  printf '%s' "$boot"
+}
+persist_loaded_node() {
+  save_node "$ID" "$TYPE" "$NAME" "$LISTEN_PORT" "$PUBLIC_PORT" "$SERVICE" "$CONFIG" "$URI_FILE" "$NETWORK_MODE" "${DESIRED_STATE:-running}" "${STOP_BOOT_ID:-}" "${SOCKS_EXIT_IP:-}" "${SOCKS_UDP:-}"
+}
+# Callback state lives in the enclosing node_transaction subshell.
+# shellcheck disable=SC2030,SC2031
+_create_node_commit() {
+  local id=$1 type=$2 name=$3 description=$4
+  local tmp="$nt_work/new-config" uri="$nt_work/new-uri"
+  if [[ $type == direct ]]; then write_common_config "$listen_port" "$auth" >"$tmp" || return 1
+  else render_isp_config "$listen_port" "$auth" "$outbound" >"$tmp" || return 1; fi
+  install_owned 640 hysteria "$tmp" "$config" || return 1
+  printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0#%s\n' "$auth" "$DOMAIN" "$public_port" "$DOMAIN" "$name" >"$uri" || return 1
+  install_owned 600 root "$uri" "$uri_file" || return 1
+  nt_units=1
+  write_service "$service" "$description" "$config" || return 1
+  if ! grep -Fxq "$listen_port/udp" "$FIREWALL_STATE" 2>/dev/null; then nt_firewall=$listen_port; fi
+  open_firewall "$listen_port" udp || return 1
+  nt_runtime=1; nt_enable=1
+  start_checked "$service" "$listen_port" || return 1
+  save_node "$id" "$type" "$name" "$listen_port" "$public_port" "$service" "$config" "$uri_file" "$mode" running "" "${SOCKS_EXIT_IP:-}" "${SOCKS_UDP:-}"
+}
+# Callback state lives in the enclosing node_transaction subshell.
+# shellcheck disable=SC2030,SC2031
+_replace_isp_commit() {
+  render_isp_config "$LISTEN_PORT" "$auth" "$outbound" >"$nt_work/new-config" || return 1
+  install_owned 640 hysteria "$nt_work/new-config" "$CONFIG" || return 1
+  if [[ $nt_active == active ]]; then
+    nt_runtime=1
+    restart_unit_checked "$SERVICE" "$LISTEN_PORT" || return 1
+  fi
+  SOCKS_EXIT_IP=$1; SOCKS_UDP=$2
+  persist_loaded_node
+}
+# Callback state lives in the enclosing node_transaction subshell.
+# shellcheck disable=SC2030,SC2031
+_rename_node_commit() {
+  local new=$1
+  [[ -r $URI_FILE ]] || return 1
+  python3 - "$URI_FILE" "$new" >"$nt_work/new-uri" <<'PY' || return 1
+from pathlib import Path
+import sys
+from urllib.parse import urlsplit, urlunsplit
+uri = urlsplit(Path(sys.argv[1]).read_text(encoding='utf-8').strip())
+print(urlunsplit(uri._replace(fragment=sys.argv[2])))
+PY
+  NAME=$new
+  persist_loaded_node || return 1
+  install_owned 600 root "$nt_work/new-uri" "$URI_FILE"
+}
+# Callback state lives in the enclosing node_transaction subshell.
+# shellcheck disable=SC2030,SC2031
+_node_power_commit() {
+  case $1 in
+    stop)
+      STOP_BOOT_ID=$(current_boot_id) || return 1
+      nt_runtime=1
+      systemctl stop "$SERVICE" || return 1
+      DESIRED_STATE=stopped ;;
+    start|restart)
+      if [[ $1 == restart || $nt_active != active ]]; then
+        nt_runtime=1; nt_enable=1
+        start_checked "$SERVICE" "$LISTEN_PORT" || return 1
+      fi
+      DESIRED_STATE=running; STOP_BOOT_ID="" ;;
+    *) return 1 ;;
+  esac
+  persist_loaded_node
 }
 
 create_direct() {
   load_manager
   [[ ! -e $NODE_DIR/direct.env ]] || die "直连节点已经存在。"
-  local listen_port public_port mode auth config service uri_file tmp
+  local listen_port public_port mode auth config service uri_file
   mode=$NETWORK_MODE
   while true; do
     listen_port=$(ask_valid_port "直连节点" "VPS 内部 UDP 监听端口" "443") || return $?
@@ -1151,12 +1312,7 @@ create_direct() {
     done
   else public_port=$listen_port; fi
   auth=$(openssl rand -hex 24); config="$HYSTERIA_DIR/direct.yaml"; service=hy2m-direct.service; uri_file="$EXPORT_DIR/hy2-direct.txt"
-  tmp=$(mktemp); cleanup_files+=("$tmp"); write_common_config "$listen_port" "$auth" >"$tmp"
-  install -o root -g hysteria -m 640 "$tmp" "$config"
-  printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0#HY2-Direct\n' "$auth" "$DOMAIN" "$public_port" "$DOMAIN" >"$uri_file"; chmod 600 "$uri_file"
-  write_service "$service" "HY2 Manager Direct Node" "$config"; open_firewall "$listen_port" udp
-  if ! start_checked "$service" "$listen_port"; then systemctl disable --now "$service" >/dev/null 2>&1 || true; rm -f "$config" "$SERVICE_DIR/$service" "$uri_file"; close_firewall "$listen_port" udp; die "直连节点启动失败，已回滚。"; fi
-  save_node direct direct HY2-Direct "$listen_port" "$public_port" "$service" "$config" "$uri_file" "$mode"
+  node_transaction direct _create_node_commit direct direct HY2-Direct "HY2 Manager Direct Node" || return $?
   if [[ $mode == nat ]]; then warn "请确认服务商控制台已有：公网 UDP $public_port → 内部 UDP $listen_port"; fi
   ok "直连节点已创建。"
 }
@@ -1290,7 +1446,7 @@ next_isp_slot() { local i; for i in $(seq 1 20); do [[ -e $NODE_DIR/isp$i.env ]]
 create_isp() {
   load_manager
   [[ -r $NODE_DIR/direct.env ]] || legacy_direct_available || die "必须先存在HY2直连节点，才能添加ISP节点。"
-  local index id name listen_default listen_port public_port mode auth config service uri_file tmp outbound
+  local index id name listen_default listen_port public_port mode auth config service uri_file outbound
   index=$(next_isp_slot); id="isp$index"; name="HY2-ISP-Full-$index"; [[ $index == 1 ]] && name=HY2-ISP-Full
   mode=$NETWORK_MODE; listen_default=$((7443 + index * 1000))
   while true; do
@@ -1313,14 +1469,7 @@ create_isp() {
     confirm "SOCKS5 测试失败，是否重新输入 SOCKS5 信息？选择否将返回主菜单。" || return 0
   done
   auth=$(openssl rand -hex 24); config="$HYSTERIA_DIR/$id.yaml"; service="hy2m-$id.service"; uri_file="$EXPORT_DIR/hy2-$id.txt"; outbound="isp_all_$index"
-  tmp=$(mktemp); cleanup_files+=("$tmp")
-  render_isp_config "$listen_port" "$auth" "$outbound" >"$tmp"
-  install -o root -g hysteria -m 640 "$tmp" "$config"
-  printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=0#%s\n' "$auth" "$DOMAIN" "$public_port" "$DOMAIN" "$name" >"$uri_file"; chmod 600 "$uri_file"
-  write_service "$service" "HY2 Manager ISP Full Node $index" "$config"; open_firewall "$listen_port" udp
-  if ! start_checked "$service" "$listen_port"; then systemctl disable --now "$service" >/dev/null 2>&1 || true; rm -f "$config" "$SERVICE_DIR/$service" "$uri_file"; close_firewall "$listen_port" udp; die "ISP 节点启动失败，已回滚。"; fi
-  save_node "$id" isp "$name" "$listen_port" "$public_port" "$service" "$config" "$uri_file" "$mode"
-  printf 'SOCKS_EXIT_IP=%q\nSOCKS_UDP=%q\n' "$SOCKS_EXIT_IP" "$SOCKS_UDP" >>"$NODE_DIR/$id.env"
+  node_transaction "$id" _create_node_commit "$id" isp "$name" "HY2 Manager ISP Full Node $index" || return $?
   if [[ $mode == nat ]]; then warn "请确认服务商控制台已有：公网 UDP $public_port → 内部 UDP $listen_port"; fi
   [[ $SOCKS_UDP == supported ]] || warn "该 ISP SOCKS5 不支持 UDP；网页 TCP/HTTPS 通常可用，必须使用 UDP 的应用可能失败。"
   ok "ISP 全局节点已创建；配置只定义 ISP outbound，不会故障回退到 VPS。"
@@ -1329,13 +1478,13 @@ create_isp() {
 
 replace_isp() {
   load_manager
-  local id=${1:-} f old_name old_listen old_public old_service old_config old_uri old_mode auth outbound tmp backup
+  local id=${1:-} f old_name old_config auth outbound
   [[ -n $id ]] || id=$(select_node isp) || return $?
   [[ $id =~ ^isp[0-9]+$ && -r $NODE_DIR/$id.env ]] || die "只能选择已存在的 ISP 节点。"
   f="$NODE_DIR/$id.env"
   # shellcheck disable=SC1090
   source "$f"
-  old_name=$NAME; old_listen=$LISTEN_PORT; old_public=$PUBLIC_PORT; old_service=$SERVICE; old_config=$CONFIG; old_uri=$URI_FILE; old_mode=$NETWORK_MODE
+  old_name=$NAME; old_config=$CONFIG
   auth=$(awk -F'"' '/^[[:space:]]*password:/{print $2; exit}' "$old_config")
   [[ $auth =~ ^[0-9a-f]{48}$ ]] || die "无法安全读取现有 HY2 认证信息。"
   while true; do
@@ -1344,14 +1493,8 @@ replace_isp() {
     unset SOCKS_PASS
     confirm "SOCKS5 测试失败，是否重新输入？选择否将返回主菜单。" || return 0
   done
-  outbound="isp_all_${id#isp}"; tmp=$(mktemp); backup=$(mktemp); cleanup_files+=("$tmp" "$backup")
-  render_isp_config "$old_listen" "$auth" "$outbound" >"$tmp"; cp -a "$old_config" "$backup"
-  install -o root -g hysteria -m 640 "$tmp" "$old_config"
-  if ! start_checked "$old_service" "$old_listen"; then
-    warn "新 ISP 配置启动失败，恢复旧配置。"; install -o root -g hysteria -m 640 "$backup" "$old_config"; systemctl restart "$old_service" || true; die "更换失败，旧配置已恢复。"
-  fi
-  save_node "$id" isp "$old_name" "$old_listen" "$old_public" "$old_service" "$old_config" "$old_uri" "$old_mode"
-  printf 'SOCKS_EXIT_IP=%q\nSOCKS_UDP=%q\n' "$SOCKS_EXIT_IP" "$SOCKS_UDP" >>"$f"
+  outbound="isp_all_${id#isp}"
+  node_transaction "$id" _replace_isp_commit "$SOCKS_EXIT_IP" "$SOCKS_UDP" || return $?
   unset SOCKS_PASS
   ok "$old_name 已更换 ISP；HY2 链接和密码保持不变。"
 }
@@ -1366,12 +1509,9 @@ recorded_port_free() {
   return 0
 }
 
-change_node_port() (
+change_node_port() {
   load_manager
-  # Subshell-scoped (not function-local): Bash may unwind locals before an
-  # EXIT trap caused by errexit, and rollback must still see this state.
-  id=${1:-}; new_listen=""; new_public=""; old_listen=""; old_public=""; work=""
-  changed=0; committed=0; new_rule=0
+  local id=${1:-} new_listen="" new_public="" old_listen="" old_public=""
   [[ -n $id ]] || id=$(select_node) || return $?
   [[ $id =~ ^(direct|isp[0-9]+)$ ]] || die "无效节点。"
   load_node "$id"
@@ -1392,44 +1532,28 @@ change_node_port() (
   fi
   if [[ $new_listen == "$old_listen" && $new_public == "$old_public" ]]; then ok "端口未改变。"; return 0; fi
   confirm "将 $NAME 端口 $old_listen/$old_public 改为 $new_listen/$new_public（内部/公网）？可能短暂断连，客户端需更新链接。" || return 0
-  work=$(mktemp -d "$STATE_DIR/.port-change.XXXXXX")
-  # Called by EXIT/INT/TERM rather than a direct function invocation.
-  # shellcheck disable=SC2317
-  port_change_cleanup() {
-    local rc=$? restored=1
-    trap - EXIT INT TERM
-    if ((changed && !committed)); then
-      install -o root -g hysteria -m 640 "$work/config.before" "$CONFIG" || restored=0
-      install -o root -g root -m 600 "$work/uri.before" "$URI_FILE" || restored=0
-      install -o root -g root -m 600 "$work/state.before" "$NODE_DIR/$id.env" || restored=0
-      if [[ $new_listen != "$old_listen" ]]; then start_checked "$SERVICE" "$old_listen" || restored=0; fi
-      if ((new_rule)); then close_firewall "$new_listen" udp || restored=0; fi
-      if ((restored)); then warn "修改未完成，已恢复旧配置和端口。"; else warn "自动恢复未完成，保留备份：$work"; rc=1; fi
-    fi
-    if ((restored)); then rm -rf -- "$work"; fi
-    cleanup
-    exit "$rc"
-  }
-  trap port_change_cleanup EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  cp -p "$CONFIG" "$work/config.before"
-  cp -p "$URI_FILE" "$work/uri.before"
-  cp -p "$NODE_DIR/$id.env" "$work/state.before"
-  python3 - "$work" "$old_listen" "$new_listen" "$new_public" <<'PY'
+  node_transaction "$id" _change_port_commit || return $?
+  if [[ $new_listen != "$old_listen" ]]; then close_firewall "$old_listen" udp || warn "旧防火墙规则清理失败，请检查。"; fi
+  [[ $NETWORK_MODE != nat ]] || warn "请修改服务商映射：公网 UDP $new_public → 内部 UDP $new_listen。"
+  ok "端口已更新，密码及 ISP 凭据保持不变，请重新导入节点链接。"
+}
+# Callback state lives in the enclosing node_transaction subshell.
+# shellcheck disable=SC2030,SC2031
+_change_port_commit() {
+  python3 - "$nt_work" "$old_listen" "$new_listen" "$new_public" <<'PY' || return 1
 from pathlib import Path
 import re, sys
 from urllib.parse import urlsplit, urlunsplit
 root, old, new, public = Path(sys.argv[1]), *sys.argv[2:]
-config = (root / 'config.before').read_text(encoding='utf-8')
+config = (root / 'config.state').read_text(encoding='utf-8')
 config, count = re.subn(r'^listen: :' + re.escape(old) + r'[ \t]*$', 'listen: :' + new, config, flags=re.M)
 if count != 1:
     raise SystemExit('不支持的监听配置，未修改原文件')
-uri = urlsplit((root / 'uri.before').read_text(encoding='utf-8').strip())
+uri = urlsplit((root / 'uri.state').read_text(encoding='utf-8').strip())
 if uri.scheme != 'hysteria2' or not uri.hostname or not uri.username:
     raise SystemExit('无法识别节点链接，未修改原文件')
 authority = uri.netloc.rsplit(':', 1)[0] + ':' + public
-state = (root / 'state.before').read_text(encoding='utf-8')
+state = (root / 'node.state').read_text(encoding='utf-8')
 for field, value in [('LISTEN_PORT', new), ('PUBLIC_PORT', public)]:
     state, count = re.subn(r'^' + field + r'=.*$', field + '=' + value, state, flags=re.M)
     if count != 1:
@@ -1438,22 +1562,18 @@ for field, value in [('LISTEN_PORT', new), ('PUBLIC_PORT', public)]:
 (root / 'uri.new').write_text(urlunsplit(uri._replace(netloc=authority)) + '\n', encoding='utf-8', newline='\n')
 (root / 'state.new').write_text(state, encoding='utf-8', newline='\n')
 PY
-  changed=1
   if [[ $new_listen != "$old_listen" ]]; then
-    if ! grep -Fxq "$new_listen/udp" "$FIREWALL_STATE" 2>/dev/null; then new_rule=1; fi
-    open_firewall "$new_listen" udp
+    if ! grep -Fxq "$new_listen/udp" "$FIREWALL_STATE" 2>/dev/null; then nt_firewall=$new_listen; fi
+    open_firewall "$new_listen" udp || return 1
   fi
-  install -o root -g hysteria -m 640 "$work/config.new" "$CONFIG"
-  install -o root -g root -m 600 "$work/uri.new" "$URI_FILE"
-  if [[ $new_listen != "$old_listen" ]]; then
-    start_checked "$SERVICE" "$new_listen" || die "新端口启动检查失败。"
+  install_owned 640 hysteria "$nt_work/config.new" "$CONFIG" || return 1
+  install_owned 600 root "$nt_work/uri.new" "$URI_FILE" || return 1
+  if [[ $new_listen != "$old_listen" && $nt_active == active ]]; then
+    nt_runtime=1
+    restart_unit_checked "$SERVICE" "$new_listen" || return 1
   fi
-  install -o root -g root -m 600 "$work/state.new" "$NODE_DIR/$id.env"
-  committed=1
-  if [[ $new_listen != "$old_listen" ]]; then close_firewall "$old_listen" udp || warn "旧防火墙规则清理失败，请检查。"; fi
-  [[ $NETWORK_MODE != nat ]] || warn "请修改服务商映射：公网 UDP $new_public → 内部 UDP $new_listen。"
-  ok "端口已更新，密码及 ISP 凭据保持不变，请重新导入节点链接。"
-)
+  install_owned 600 root "$nt_work/state.new" "$NODE_DIR/$id.env"
+}
 
 # ---------------- 域名迁移 ----------------
 # 0.2 版把 DOMAIN 写进 manager.env 和每个节点链接，换域名只能重装。
@@ -2110,8 +2230,7 @@ start_node() {
   load_manager; local id=${1:-}
   [[ -n $id ]] || id=$(select_node) || return $?
   load_node "$id"
-  if [[ $(node_service_state "$SERVICE") == active ]]; then ok "$NAME 已在运行。"; return 0; fi
-  start_checked "$SERVICE" "$LISTEN_PORT" || die "启动失败，已输出最近日志。"
+  node_transaction "$id" _node_power_commit start || return $?
   ok "$NAME 已启动。"
 }
 
@@ -2119,9 +2238,10 @@ stop_node() {
   load_manager; local id=${1:-}
   [[ -n $id ]] || id=$(select_node) || return $?
   load_node "$id"
-  if [[ $(node_service_state "$SERVICE") != active ]]; then ok "$NAME 本来就没在运行。"; return 0; fi
-  confirm "停止 $NAME？已连接的客户端会立即断连。" || return 0
-  systemctl stop "$SERVICE" || die "停止失败。"
+  if [[ $(node_service_state "$SERVICE") == active ]]; then
+    confirm "停止 $NAME？已连接的客户端会立即断连。" || return 0
+  fi
+  node_transaction "$id" _node_power_commit stop || return $?
   ok "$NAME 已停止；服务仍是开机自启状态，重启后会重新启动。"
 }
 
@@ -2129,7 +2249,7 @@ restart_node() {
   load_manager; local id=${1:-}
   [[ -n $id ]] || id=$(select_node) || return $?
   load_node "$id"
-  start_checked "$SERVICE" "$LISTEN_PORT" || die "重启失败，已输出最近日志。"
+  node_transaction "$id" _node_power_commit restart || return $?
   ok "$NAME 已重启。"
 }
 
@@ -2179,27 +2299,12 @@ human_bytes() {
 }
 
 rename_node() {
-  load_manager; local id=${1:-} f new
+  load_manager; local id=${1:-} new
   [[ -n $id ]] || id=$(select_node) || return $?
-  load_node "$id"; f="$NODE_DIR/$id.env"
+  load_node "$id"
   new=$(ask_valid_name "重命名 $NAME" "新名称（只影响显示，不改变链接）" "$NAME") || return $?
   [[ $new != "$NAME" ]] || { ok "名称未改变。"; return 0; }
-  local tmp; tmp=$(mktemp); cleanup_files+=("$tmp")
-  sed "s|^NAME=.*|NAME=$(printf '%q' "$new")|" "$f" >"$tmp"
-  install -o root -g root -m 600 "$tmp" "$f"
-  # URI 里的 #fragment 是客户端显示名，跟着改，密码和域名不动。
-  if [[ -r ${URI_FILE:-} ]]; then
-    local utmp; utmp=$(mktemp); cleanup_files+=("$utmp")
-    python3 - "$URI_FILE" "$new" >"$utmp" <<'PY'
-from pathlib import Path
-import sys
-from urllib.parse import urlsplit, urlunsplit, quote
-path, name = Path(sys.argv[1]), sys.argv[2]
-uri = urlsplit(path.read_text(encoding='utf-8').strip())
-print(urlunsplit(uri._replace(fragment=name)), end='')
-PY
-    install -o root -g root -m 600 "$utmp" "$URI_FILE"
-  fi
+  node_transaction "$id" _rename_node_commit "$new" || return $?
   ok "已重命名为 $new；HY2 链接的密码、端口和域名保持不变。"
 }
 

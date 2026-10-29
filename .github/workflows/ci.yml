@@ -33,6 +33,9 @@ jobs:
           bash tests/domain-transaction-test.sh
           bash tests/certificate-rollback-test.sh
           bash tests/initial-certificate-test.sh
+          bash tests/hostname-verification-test.sh
+          bash tests/node-transaction-test.sh
+          bash tests/stop-intent-test.sh
           bash tests/reliability-test.sh
           bash tests/locking-test.sh
           bash tests/renewal-test.sh

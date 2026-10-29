@@ -76,7 +76,7 @@ run_case() (
   curl() { printf 'unexpected network command\n' >>"$events"; return 98; }
   dig() { printf 'unexpected network command\n' >>"$events"; return 98; }
   apt-get() { printf 'apt-get %s\n' "$*" >>"$events"; [[ $fail_at != plugin ]]; }
-  openssl() { printf 'mock-public-key\n'; }
+  openssl() { if [[ " $* " == *" -checkhost "* ]]; then printf 'Hostname %s does match certificate\n' "${*: -1}"; else printf 'mock-public-key\n'; fi; }
   ss() { printf 'UNCONN 0 0 0.0.0.0:443 0.0.0.0:*\n'; }
   sleep() { :; }
   journalctl() { :; }
