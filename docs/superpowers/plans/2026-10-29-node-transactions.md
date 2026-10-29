@@ -13,7 +13,7 @@ User approved execution of the four-step plan on 2026-10-29; retain existing rem
 - [x] Reproduce zero-exit mismatch in both scripts and fix hostname verification; retain real-certificate tests.
 - [x] Add failing create/replace/rename/power transaction fault-injection suite, implement common boundary and atomic record publication.
 - [x] Add boot-scoped stop intent, backup schema compatibility and guard health tests.
-- [ ] Verify local suites/lint, independent review, push additive commits, inspect complete Linux CI and fix failures.
+- [x] Verify local suites/lint, independent review, push additive commits, inspect complete Linux CI and fix failures.
 
 ## Review focus
 - Snapshot failures occur before service/firewall changes; late write errors/signals roll back files and runtime.
@@ -32,3 +32,5 @@ User approved execution of the four-step plan on 2026-10-29; retain existing rem
 - Final review: independent gpt-6-astra read-only review found no Critical/Important items; Linux CI remains the completion gate.
 - Final: minor (deferred): interrupted writes may leave protected .install/.state temporary files outside the transaction snapshot directory; these do not replace live configuration. Track cleanup refinement separately.
 - Final: Ruling: real VPS/systemd/UFW validation remains outside this run because no authorized target exists; simulated systemctl cannot prove host-level networking.
+
+- Completion: commit 4c157a0 pushed additively; Linux CI https://github.com/l62626266-maker/hy2-isp-manager/actions/runs/40854190011 succeeded in every step, including actual flock competition, PTY and pinned Hysteria direct/ISP smoke. No original branches or tracked files deleted; main/dev branch SHAs unchanged.
