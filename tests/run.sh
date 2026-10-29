@@ -96,7 +96,13 @@ save_node direct direct HY2-Direct 443 443 hy2m-direct.service "$HYSTERIA_DIR/di
 save_node isp1 isp HY2-ISP-Full 8443 8443 hy2m-isp1.service "$HYSTERIA_DIR/isp1.yaml" "$EXPORT_DIR/isp1.txt" normal
 TEST_CONFIRM=no
 confirm() { [[ $TEST_CONFIRM == yes ]]; }
-systemctl() { return 0; }
+systemctl() {
+  case ${1:-} in
+    is-active) printf 'inactive\n'; return 3 ;;
+    is-enabled) printf 'enabled\n'; return 0 ;;
+    *) return 0 ;;
+  esac
+}
 view_before=$(show_nodes)
 [[ $view_before == *HY2-Direct* && $view_before == *HY2-ISP-Full* ]] && pass "show Direct and ISP independently" || fail "show Direct and ISP independently"
 TEST_CONFIRM=yes
@@ -120,6 +126,49 @@ legacy_view=$(show_nodes)
 legacy_status=$(status_all)
 [[ $legacy_status == *'现有兼容节点视图'* && $legacy_status == *'legacy.example.com'* ]] && pass "legacy Direct status without manager state" || fail "legacy Direct status without manager state"
 grep -Fq '必须先存在HY2直连节点，才能添加ISP节点' hy2-manager && pass "ISP requires Direct" || fail "ISP requires Direct"
+
+# --- 0.3 新增能力 -----------------------------------------------------------
+check "byte formatter handles small values" test "$(human_bytes 512)" = "512 B"
+check "byte formatter handles gigabytes" test "$(human_bytes 1610612736)" = "1.5 GB"
+check "byte formatter passes through garbage" test "$(human_bytes n/a)" = "n/a"
+
+# 换域名必须改写链接里的 host 和 sni，且不能碰密码。
+mkdir -p "$HY2M_HYSTERIA_DIR/tls" "$HY2M_EXPORT_DIR"
+printf 'hysteria2://deadbeef@old.example.com:8443/?sni=old.example.com&insecure=0#HY2-ISP\n' >"$HY2M_EXPORT_DIR/hy2-isp1.txt"
+rewrite_node_domain "$HY2M_EXPORT_DIR/hy2-isp1.txt" old.example.com new.example.com
+rewritten=$(<"$HY2M_EXPORT_DIR/hy2-isp1.txt")
+[[ $rewritten == 'hysteria2://deadbeef@new.example.com:8443/?sni=new.example.com&insecure=0#HY2-ISP' ]] && pass "domain migration rewrites host and sni" || fail "domain migration rewrites host and sni"
+[[ $rewritten == *deadbeef* ]] && pass "domain migration keeps the password" || fail "domain migration keeps the password"
+[[ $(stat -c '%a' "$HY2M_EXPORT_DIR/hy2-isp1.txt") == 600 ]] && pass "migrated link stays mode 600" || fail "migrated link stays mode 600"
+printf 'not a uri\n' >"$HY2M_EXPORT_DIR/broken.txt"
+if rewrite_node_domain "$HY2M_EXPORT_DIR/broken.txt" old.example.com new.example.com 2>/dev/null; then fail "reject rewriting a malformed link"; else pass "reject rewriting a malformed link"; fi
+[[ $(<"$HY2M_EXPORT_DIR/broken.txt") == 'not a uri' ]] && pass "malformed link left untouched" || fail "malformed link left untouched"
+
+# 备份清单和还原都必须能在临时目录里跑通，且拒绝越界文件名。
+mkdir -p "$HY2M_STATE_DIR/nodes" "$HY2M_HYSTERIA_DIR/tls" "$HY2M_EXPORT_DIR"
+printf 'DOMAIN=test.example.com\nNETWORK_MODE=normal\nPUBLIC_IP=192.0.2.1\nCERT_MODE=http\n' >"$HY2M_STATE_DIR/manager.env"
+printf 'listen: :443\n' >"$HY2M_HYSTERIA_DIR/direct.yaml"
+printf 'hysteria2://deadbeef@test.example.com:443/?sni=test.example.com#HY2-Direct\n' >"$HY2M_EXPORT_DIR/hy2-direct.txt"
+write_env "$HY2M_STATE_DIR/nodes/direct.env" ID direct TYPE direct NAME HY2-Direct LISTEN_PORT 443 PUBLIC_PORT 443 \
+  SERVICE hy2m-direct.service CONFIG "$HY2M_HYSTERIA_DIR/direct.yaml" URI_FILE "$HY2M_EXPORT_DIR/hy2-direct.txt" NETWORK_MODE normal
+printf '[Service]\nExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/direct.yaml\n' >"$HY2M_SERVICE_DIR/hy2m-direct.service"
+printf 'hello\n' >"$HY2M_STATE_DIR/marker.txt"
+make_backup >/dev/null
+backups=$(list_backups)
+[[ $backups == *hy2m-*.tar.gz* ]] && pass "backup listing shows archives" || fail "backup listing shows archives"
+backup_name=$(awk '{print $2}' <<<"$backups" | head -1)
+printf 'changed\n' >"$HY2M_STATE_DIR/marker.txt"
+rm -f "$HY2M_EXPORT_DIR/hy2-direct.txt"
+(TEST_CONFIRM=yes; restore_backup "$backup_name" >/dev/null)
+[[ $(<"$HY2M_STATE_DIR/marker.txt") == hello ]] && pass "restore brings back file contents" || fail "restore brings back file contents"
+[[ -f $HY2M_EXPORT_DIR/hy2-direct.txt ]] && pass "restore brings back node exports" || fail "restore brings back node exports"
+if (restore_backup "../etc/passwd" >/dev/null 2>&1); then fail "reject backup path traversal"; else pass "reject backup path traversal"; fi
+if (restore_backup "no-such-backup.tar.gz" >/dev/null 2>&1); then fail "reject missing backup"; else pass "reject missing backup"; fi
+
+# 卸载默认保留证书与网络优化，只有明确确认才清理。
+grep -Fq '同时删除本管理器申请的系统证书和网络优化' hy2-manager && pass "uninstall asks before purging certs" || fail "uninstall asks before purging certs"
+grep -Fq 'certbot delete --cert-name' hy2-manager && pass "uninstall can purge the certificate" || fail "uninstall can purge the certificate"
+grep -Fq 'SYSCTL_FILE' hy2-manager && pass "uninstall touches the managed sysctl file only" || fail "uninstall touches the managed sysctl file only"
 
 if (( failures )); then printf '\n%d test(s) failed.\n' "$failures" >&2; exit 1; fi
 printf '\nAll tests passed.\n'

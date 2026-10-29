@@ -8,9 +8,16 @@ readonly GUARD_SHA256="27d4200ce686b56332bbd23fbd44b3fb810cb0991d9390b1544c8c5ab
 
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行。"
-for cmd in curl sha256sum mktemp install openssl systemctl runuser; do command -v "$cmd" >/dev/null 2>&1 || die "缺少命令：$cmd"; done
+for cmd in curl sha256sum mktemp install openssl systemctl runuser flock; do command -v "$cmd" >/dev/null 2>&1 || die "缺少命令：$cmd"; done
 
-tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT INT TERM
+lock_file="${HY2_LOCK_FILE:-/run/lock/hy2-isp-manager.lock}"
+[[ -d ${lock_file%/*} && ! -L $lock_file ]] || die "不安全的锁路径。"
+exec {installer_lock_fd}>>"$lock_file"
+flock -n "$installer_lock_fd" || die "另一个 HY2 操作正在执行，请稍后重试。"
+tmp=$(mktemp); config_tmp=""; binary_tmp=""
+trap 'rm -f -- "$tmp" "${config_tmp:-}" "${binary_tmp:-}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 script_dir=""
 if [[ -n ${BASH_SOURCE[0]:-} && ${BASH_SOURCE[0]} != /dev/stdin && ${BASH_SOURCE[0]} != bash ]]; then
   if ! script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd); then script_dir=""; fi
@@ -25,7 +32,9 @@ else
   [[ $actual == "$GUARD_SHA256" ]] || die "hy2-cert-guard SHA256 校验失败。"
 fi
 bash -n "$tmp"
-install -o root -g root -m 755 "$tmp" /usr/local/sbin/hy2-cert-guard
+binary_tmp=$(mktemp /usr/local/sbin/.hy2-cert-guard.XXXXXXXX)
+install -o root -g root -m 755 "$tmp" "$binary_tmp"
+mv -f -- "$binary_tmp" /usr/local/sbin/hy2-cert-guard
 ln -sfn /usr/local/sbin/hy2-cert-guard /usr/local/bin/hy2-cert-guard
 
 config=/etc/hy2-cert-guard.conf
@@ -64,6 +73,7 @@ if [[ ! -r $config || ${HY2CG_RECONFIGURE:-0} == 1 ]]; then
   expected_ip=${HY2CG_EXPECTED_IPV4:-}
   if [[ -z $expected_ip ]]; then expected_ip=$(curl -4fsS --max-time 15 https://api.ipify.org || true); fi
   if [[ -r $config ]]; then cp -a "$config" "$config.before-$(date +%Y%m%d-%H%M%S)"; fi
+  config_tmp=$(mktemp /etc/.hy2-cert-guard.XXXXXXXX)
   {
     printf 'DOMAIN=%q\n' "$domain"
     printf 'EXPECTED_IPV4=%q\n' "$expected_ip"
@@ -73,23 +83,29 @@ if [[ ! -r $config || ${HY2CG_RECONFIGURE:-0} == 1 ]]; then
     printf 'SERVICES=%q\n' "$services"
     printf 'UDP_PORTS=%q\n' "$ports"
     printf 'WARN_DAYS=30\nFAIL_DAYS=14\n'
-  } >"$config"
-  chmod 600 "$config"
+  } >"$config_tmp"
+  chmod 600 "$config_tmp"
+  mv -f -- "$config_tmp" "$config"
 fi
 
-if ! /usr/local/sbin/hy2-cert-guard install-system; then
+export HY2CG_SOURCE_ONLY=1
+# shellcheck disable=SC1091
+source /usr/local/sbin/hy2-cert-guard
+if ! install_system; then
   die "安装完成但首次健康检查失败；现有证书和HY2服务未被替换。"
 fi
 
 backup_dir="/var/lib/hy2-cert-guard/legacy-hooks/$(date +%Y%m%d-%H%M%S)"
 for hook in /etc/letsencrypt/renewal-hooks/deploy/*; do
   [[ -f $hook && $hook != /etc/letsencrypt/renewal-hooks/deploy/hy2-cert-guard ]] || continue
-  if grep -Eq 'hysteria|/etc/hysteria' "$hook" 2>/dev/null; then
+  # Only retire the manager hook when this guard verified that it covers all
+  # managed targets and their current identity. Preserve unrelated/mixed hooks.
+  if [[ ${hook##*/} == hy2-manager-copy.sh && ${MANAGER_TARGETS:-0} == 1 ]]; then
     install -d -o root -g root -m 700 "$backup_dir"
     mv "$hook" "$backup_dir/"
   fi
 done
 if [[ -d $backup_dir ]]; then printf '旧Hysteria续期钩子已备份到：%s\n' "$backup_dir"; fi
 printf '安装成功。状态：\n'
-/usr/local/sbin/hy2-cert-guard status
+status_cmd
 printf '\n建议现在执行一次：sudo hy2-cert-guard dry-run\n'

@@ -19,6 +19,8 @@ readonly HYSTERIA_VERSION="${HY2M_HYSTERIA_VERSION:-v2.12.2}"
 readonly HYSTERIA_BIN="${HY2M_HYSTERIA_BIN:-$APP_DIR/bin/hysteria}"
 readonly MANAGER_STATE="$STATE_DIR/manager.env"
 readonly CF_CREDENTIALS="$STATE_DIR/cloudflare.ini"
+readonly LETSENCRYPT_DIR="${HY2M_LETSENCRYPT_DIR:-/etc/letsencrypt}"
+readonly RENEWAL_HOOK="$LETSENCRYPT_DIR/renewal-hooks/deploy/hy2-manager-copy.sh"
 readonly SYSCTL_FILE="${HY2M_SYSCTL_FILE:-/etc/sysctl.d/99-hy2-manager.conf}"
 readonly SWAP_FILE="${HY2M_SWAP_FILE:-/swapfile-hy2m}"
 readonly FIREWALL_STATE="$STATE_DIR/firewall.rules"
@@ -45,7 +47,7 @@ cleanup_files=()
 cleanup() { local f; for f in "${cleanup_files[@]:-}"; do [[ -z "$f" ]] || rm -f -- "$f"; done; }
 trap cleanup EXIT
 
-require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo hy2-manager"; }
+require_root() { [[ ${HY2M_TESTING:-0} == 1 || ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo hy2-manager"; }
 require_systemd() { if ! command -v systemctl >/dev/null || [[ ! -d /run/systemd/system ]]; then die "需要正在运行的 systemd。"; fi; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
 
@@ -100,10 +102,31 @@ ask_secret() {
   [[ $out != :menu ]] || return 20
   printf '%s' "$out"
 }
+# One persistent lock inode, outside trees replaced by restore/uninstall.
+# The same protocol is used by the standalone guard and generated renewal hook.
+with_mutation_lock() (
+  local lock_file="${HY2_LOCK_FILE:-/run/lock/hy2-isp-manager.lock}" lock_fd
+  local -a lock_args=(-n)
+  if [[ ${1:-} == --wait ]]; then lock_args=(-w 300); shift; fi
+  command -v flock >/dev/null 2>&1 || { printf '缺少 flock，拒绝无锁修改。\n' >&2; return 1; }
+  [[ -d ${lock_file%/*} && ! -L $lock_file ]] || return 1
+  exec {lock_fd}>>"$lock_file" || return 1
+  flock "${lock_args[@]}" "$lock_fd" || { printf '另一个 HY2 操作正在执行，请稍后重试。\n' >&2; return 75; }
+  "$@"
+)
+mutation_action() {
+  case $1 in
+    initial_install|install_self|create_direct|create_isp|replace_isp|change_node_port|change_domain|rename_node|start_node|stop_node|restart_node|remove_node|uninstall_all|make_backup|restore_backup|certificate_http|certificate_cloudflare|copy_certificate|renew_certificate) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 run_menu_action() {
   local rc
   set +e
-  ( set -Eeuo pipefail; trap cleanup EXIT; "$@" )
+  ( set -Eeuo pipefail; trap cleanup EXIT;
+    if mutation_action "$1"; then with_mutation_lock "$@"; else "$@"; fi
+  )
   rc=$?
   set -e
   if ((rc != 0 && rc != 20)); then warn "当前操作未完成（错误码 $rc），已返回菜单，请查看上方原因。"; fi
@@ -130,10 +153,47 @@ choose() {
 
 write_env() {
   local path=$1; shift; local tmp key value
-  tmp=$(mktemp); cleanup_files+=("$tmp")
-  while (( $# >= 2 )); do key=$1; value=$2; shift 2; printf '%s=%q\n' "$key" "$value" >>"$tmp"; done
-  if [[ ${HY2M_TESTING:-0} == 1 ]]; then install -m 600 "$tmp" "$path"; else install -o root -g root -m 600 "$tmp" "$path"; fi
+  [[ ! -L $path && -d ${path%/*} && $# -gt 0 && $(( $# % 2 )) == 0 ]] || return 1
+  tmp=$(mktemp "${path%/*}/.state.XXXXXX") || return 1
+  cleanup_files+=("$tmp")
+  while (( $# )); do
+    key=$1; value=$2; shift 2
+    [[ $key =~ ^[A-Z_][A-Z_0-9]*$ ]] || { rm -f -- "$tmp"; return 1; }
+    printf '%s=%q\n' "$key" "$value" >>"$tmp" || return 1
+  done
+  chmod 600 "$tmp" || return 1
+  if [[ ${HY2M_TESTING:-0} != 1 ]]; then chown root:root "$tmp" || return 1; fi
+  mv -f -- "$tmp" "$path"
 }
+
+# 装文件时统一走这里：测试环境没有 root/hysteria 账户，跳过属主设置。
+install_owned() {
+  local mode=$1 group=$2 src=$3 dst=$4 tmp
+  [[ ! -L $dst && ( ! -e $dst || -f $dst ) && -d ${dst%/*} ]] || return 1
+  tmp=$(mktemp "${dst%/*}/.install.XXXXXXXX") || return 1
+  cleanup_files+=("$tmp")
+  if [[ ${HY2M_TESTING:-0} == 1 ]]; then
+    install -m "$mode" "$src" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  else
+    install -o root -g "$group" -m "$mode" "$src" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  fi
+  if ! mv -f -- "$tmp" "$dst"; then rm -f -- "$tmp"; return 1; fi
+}
+
+install_dir() {
+  local mode=$1 group=$2 dst=$3
+  if [[ ${HY2M_TESTING:-0} == 1 ]]; then mkdir -p "$dst"
+  else install -d -o root -g "$group" -m "$mode" "$dst"; fi
+}
+
+# write_env quotes values with %q, so a plain awk split would return escaped
+# paths. Read one key in a subshell, the same way load_node reads the file.
+env_get() (
+  local key=$2
+  # shellcheck disable=SC1090
+  source "$1" >/dev/null 2>&1 || exit 1
+  printf '%s' "${!key-}"
+)
 load_manager() { [[ -r $MANAGER_STATE ]] || die "尚未安装节点，请先运行安装。"
   # beta.3 and older wrote APP_VERSION into manager.env. Ignore that legacy
   # field so it cannot overwrite the manager's readonly runtime version.
@@ -210,13 +270,324 @@ ensure_layout() {
   install -d -o hysteria -g hysteria -m 750 /var/lib/hysteria
 }
 
-make_backup() {
-  local stamp target items=()
-  stamp=$(date +%Y%m%d-%H%M%S); target="$BACKUP_DIR/hy2m-$stamp.tar.gz"
-  mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
-  for p in "$STATE_DIR" "$HYSTERIA_DIR" "$SERVICE_DIR/hy2m-direct.service" "$SERVICE_DIR"/hy2m-isp*.service; do [[ ! -e $p ]] || items+=("${p#/}"); done
-  if ((${#items[@]})); then (cd / && tar -czf "$target" "${items[@]}"); chmod 600 "$target"; ok "备份：$target"; fi
+# Versioned relative archives; validate members/state before extraction or use.
+# Old incomplete archives require manual recovery, not a guessed full restore.
+backup_archive() {
+  python3 - "$1" "$2" "${3:-}" "$STATE_DIR" "$HYSTERIA_DIR" "$EXPORT_DIR" "$SERVICE_DIR" "$RENEWAL_HOOK" "$BACKUP_DIR" <<'PY'
+import io, json, os, re, shlex, shutil, sys, tarfile
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit, parse_qs
+
+def native(value):
+    if os.name == 'nt' and re.match(r'^/[a-zA-Z]/', value):
+        value = value[1] + ':' + value[2:]
+    return Path(os.path.abspath(value))
+
+action, archive, dest = sys.argv[1:4]
+# Windows text mode would emit CRLF and corrupt TSV plans; force LF everywhere.
+for stream in (sys.stdout, sys.stderr):
+    stream.reconfigure(newline='\n')
+roots = dict(zip(('state', 'hysteria', 'export', 'services'), map(native, sys.argv[4:8])))
+hook, backups = map(native, sys.argv[8:10])
+unit_re = re.compile(r'hy2m-(direct|isp[0-9]+)\.service\Z')
+node_re = re.compile(r'(direct|isp[0-9]+)\.env\Z')
+word_re = re.compile(r'''(?:[A-Za-z0-9_./:@%+=,\-]+|\\[^\r\n]|'[^'\r\n]*'|"[^"$`\\\r\n]*")*\Z''')
+
+def fail(message):
+    raise ValueError(message)
+
+def within(path, root):
+    return path != root and root in path.parents
+
+def check_path(path, root):
+    if not within(path, root): fail('state path escapes its managed directory')
+    for part in (path, *path.parents):
+        if part.is_symlink(): fail('symlinks are not supported in managed paths')
+        if part == root: break
+
+def read_env(path, allowed):
+    values = {}
+    for line in path.read_text(encoding='utf-8').splitlines():
+        if not line.strip() or line.startswith('#'): continue
+        key, sep, raw = line.partition('=')
+        if not sep or key not in allowed or key in values or not word_re.fullmatch(raw):
+            fail('invalid or executable state assignment')
+        parts = shlex.split(raw, comments=False, posix=True)
+        if len(parts) > 1: fail('state assignment is not a single literal value')
+        value = parts[0] if parts else ''
+        if any(ord(c) < 32 or ord(c) == 127 for c in value): fail('control characters in state')
+        values[key] = value
+    return values
+
+def inventory(base, strict):
+    state = base / 'state' if base else roots['state']
+    manager_fields = {'INSTALLED_VERSION','APP_VERSION','DOMAIN','PUBLIC_IP','NETWORK_MODE','CERT_MODE'}
+    manager = read_env(state / 'manager.env', manager_fields) if (state / 'manager.env').exists() else {}
+    if strict and (not manager.get('DOMAIN') or manager.get('NETWORK_MODE') not in ('normal', 'nat')):
+        fail('missing or invalid manager state')
+    fields = {'ID','TYPE','NAME','LISTEN_PORT','PUBLIC_PORT','SERVICE','CONFIG','URI_FILE','NETWORK_MODE','SOCKS_EXIT_IP','SOCKS_UDP'}
+    result, ports = [], set()
+    for file in sorted((state / 'nodes').glob('*.env')):
+        if not node_re.fullmatch(file.name): fail('unrecognized node record')
+        v = read_env(file, fields); node = file.stem
+        if v.get('ID') != node or v.get('SERVICE') != 'hy2m-' + node + '.service': fail('node ID/service mismatch')
+        port = v.get('LISTEN_PORT', '')
+        if not port.isdecimal() or not 1 <= int(port) <= 65535: fail('invalid listener port')
+        if strict:
+            if int(port) in ports: fail('duplicate listener port')
+            ports.add(int(port))
+            if v.get('TYPE') != ('direct' if node == 'direct' else 'isp'): fail('invalid node type')
+            public = v.get('PUBLIC_PORT', '')
+            if not public.isdecimal() or not 1 <= int(public) <= 65535: fail('invalid public port')
+            mapped = {}
+            for field, section in (('CONFIG', 'hysteria'), ('URI_FILE', 'export')):
+                original = native(v.get(field, '')); check_path(original, roots[section])
+                mapped[field] = base / section / original.relative_to(roots[section])
+                if not mapped[field].is_file(): fail('backup is missing a referenced config or export')
+            uri = urlsplit(mapped['URI_FILE'].read_text(encoding='utf-8').strip())
+            if (uri.scheme != 'hysteria2' or not uri.username or uri.hostname != manager['DOMAIN'].lower()
+                    or uri.port != int(public) or parse_qs(uri.query).get('sni') != [manager['DOMAIN']]):
+                fail('backup export does not match node/manager state')
+            if not (base / 'services' / v['SERVICE']).is_file(): fail('backup is missing a managed service')
+        result.append((node, v['SERVICE'], str(int(port))))
+    if strict and (not result or any(n.startswith('isp') for n, _, _ in result) and not any(n == 'direct' for n, _, _ in result)):
+        fail('backup has an incomplete node inventory')
+    return result
+
+try:
+    trees = list(roots.values()) + [backups]
+    for i, root in enumerate(trees):
+        if root == Path(root.anchor) or root.is_symlink(): fail('unsafe managed root')
+        for other in trees[i+1:]:
+            if root == other or within(root, other) or within(other, root): fail('managed roots must not overlap')
+    check_path(hook, hook.parent)
+    if action == 'inventory':
+        for entry in inventory(None, False): print('\t'.join(entry))
+    elif action == 'pack':
+        files = []
+        for section in ('state', 'hysteria', 'export'):
+            root = roots[section]
+            if root.exists():
+                files.append((root, section))
+                files.extend((p, section + '/' + p.relative_to(root).as_posix()) for p in sorted(root.rglob('*')))
+        files.extend((p, 'services/' + p.name) for p in sorted(roots['services'].glob('hy2m-*.service')) if unit_re.fullmatch(p.name))
+        if hook.exists() or hook.is_symlink(): files.append((hook, 'renewal-hook'))
+        if not files: fail('nothing to back up')
+        if len(files) > 10000 or sum(p.stat().st_size for p, _ in files if p.is_file() and not p.is_symlink()) > 268435456:
+            fail('managed backup exceeds safety limits')
+        for p, _ in files:
+            if p.is_symlink() or not (p.is_dir() or p.is_file()): fail('links and special files are not supported')
+        meta = json.dumps({'format': 'hy2-manager-backup', 'version': 1}).encode()
+        with tarfile.open(archive, 'w:gz') as out:
+            header = tarfile.TarInfo('manifest.json'); header.size = len(meta); header.mode = 0o600
+            out.addfile(header, io.BytesIO(meta))
+            for path, name in files: out.add(path, arcname=name, recursive=False)
+    elif action == 'stage':
+        stage = native(dest)
+        if stage.exists(): fail('staging destination must not exist')
+        with tarfile.open(archive, 'r:gz') as source:
+            members, seen, total = [], set(), 0
+            for m in source:
+                name = m.name.rstrip('/'); parts = PurePosixPath(name).parts
+                if (not name or '\\' in name or name.startswith('/') or '..' in parts or '.' in name.split('/')
+                        or any(ord(c) < 32 or ord(c) == 127 for c in name) or name in seen):
+                    fail('unsafe or duplicate archive member')
+                if not (m.isdir() or m.isfile()): fail('archive links/devices are forbidden')
+                if parts[0] in ('state', 'hysteria', 'export'): pass
+                elif name in ('manifest.json', 'renewal-hook'):
+                    if not m.isfile(): fail('invalid metadata/hook type')
+                elif parts[0] == 'services' and (len(parts) == 1 and m.isdir() or len(parts) == 2 and m.isfile() and unit_re.fullmatch(parts[1])): pass
+                else: fail('unrecognized/old archive layout; manual recovery required')
+                total += m.size
+                if total > 268435456 or m.size > 67108864 or len(members) >= 10000: fail('archive exceeds safety limits')
+                seen.add(name); members.append(m)
+            if 'manifest.json' not in seen: fail('old incomplete archive: automatic restore refused')
+            meta = json.load(source.extractfile('manifest.json'))
+            if meta != {'format': 'hy2-manager-backup', 'version': 1}: fail('unsupported backup format')
+            stage.mkdir(mode=0o700)
+            for m in members:
+                path = stage.joinpath(*PurePosixPath(m.name).parts)
+                if m.isdir(): path.mkdir(parents=True, exist_ok=True)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with path.open('xb') as out, source.extractfile(m) as inp: shutil.copyfileobj(inp, out)
+                    path.chmod(0o600)
+        for section in ('state', 'hysteria', 'export'):
+            if not (stage / section).is_dir(): fail('backup lacks a managed tree (including exports)')
+        plan = inventory(stage, True)
+        (stage / 'plan.tsv').write_text(''.join('\t'.join(row) + '\n' for row in plan), encoding='utf-8', newline='\n')
+    else: fail('unknown archive operation')
+except (OSError, ValueError, KeyError, tarfile.TarError) as exc:
+    print('Backup validation failed: ' + str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
 }
+
+make_backup() {
+  local stamp target tmp
+  [[ ! -L $BACKUP_DIR ]] || { warn "备份目录不能是符号链接。"; return 1; }
+  mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR" || return 1
+  stamp=$(date +%Y%m%d-%H%M%S) || return 1
+  tmp=$(mktemp "$BACKUP_DIR/.hy2m-$stamp.XXXXXX") || return 1
+  target="$BACKUP_DIR/hy2m-$stamp-${tmp##*.}.tar.gz"
+  if ! backup_archive pack "$tmp" || ! chmod 600 "$tmp"; then
+    rm -f -- "$tmp"; warn "备份失败，未生成可还原的备份。"; return 1
+  fi
+  if [[ -e $target ]] || ! mv -- "$tmp" "$target"; then rm -f -- "$tmp"; return 1; fi
+  ok "备份：$target"
+}
+
+list_backups() {
+  shopt -s nullglob
+  local files=("$BACKUP_DIR"/hy2m-*.tar.gz) f
+  ((${#files[@]})) || { warn "还没有任何备份：$BACKUP_DIR"; return 1; }
+  for f in "${files[@]}"; do printf '%s  %s\n' "$(du -h "$f" | cut -f1)" "${f##*/}"; done
+}
+
+managed_service_files() {
+  local f; shopt -s nullglob
+  for f in "$SERVICE_DIR"/hy2m-*.service; do
+    [[ ${f##*/} =~ ^hy2m-(direct|isp[0-9]+)\.service$ ]] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+# Destinations come only from the validated, non-overlapping managed roots,
+# never from archive member paths; the shared systemd directory is not removed.
+restore_tree() {
+  local src=$1 dst=$2 mode=$3 group=$4
+  case $dst in "$STATE_DIR"|"$HYSTERIA_DIR"|"$EXPORT_DIR") ;; *) return 1 ;; esac
+  [[ $dst == /* && $dst != / && ! -L $dst ]] || return 1
+  rm -rf -- "$dst" || return 1
+  [[ -d $src ]] || return 0
+  install_dir "$mode" "$group" "$dst" && cp -a "$src/." "$dst/" || return 1
+  if [[ ${HY2M_TESTING:-0} != 1 ]]; then
+    chown -R "root:$group" "$dst" || return 1
+    python3 - "$dst" "$mode" <<'PY'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1]); mode = int(sys.argv[2], 8)
+root.chmod(mode)
+for p in root.rglob('*'):
+    p.chmod(mode if p.is_dir() else (0o640 if mode == 0o750 else 0o600))
+PY
+  fi
+}
+
+restore_files() {
+  local src=$1 f
+  restore_tree "$src/state" "$STATE_DIR" 700 root || return 1
+  restore_tree "$src/hysteria" "$HYSTERIA_DIR" 750 hysteria || return 1
+  restore_tree "$src/export" "$EXPORT_DIR" 700 root || return 1
+  while IFS= read -r f; do rm -f -- "$f" || return 1; done < <(managed_service_files)
+  mkdir -p "$SERVICE_DIR" || return 1
+  shopt -s nullglob
+  for f in "$src/services"/*.service; do install_owned 644 root "$f" "$SERVICE_DIR/${f##*/}" || return 1; done
+  if [[ -f $src/renewal-hook ]]; then
+    mkdir -p "${RENEWAL_HOOK%/*}" || return 1
+    install_owned 750 root "$src/renewal-hook" "$RENEWAL_HOOK" || return 1
+  else
+    rm -f -- "$RENEWAL_HOOK" || return 1
+  fi
+}
+
+# Restart without touching enablement: migration and restore must not make a
+# deliberately stopped node start on boot.
+restart_unit_checked() {
+  local unit=$1 port=$2 i
+  systemctl restart "$unit" || return 1
+  for ((i=0; i<20; i++)); do
+    if systemctl is-active --quiet "$unit" && ss -lunH | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then return 0; fi
+    sleep 1
+  done
+  journalctl -u "$unit" -n 40 --no-pager >&2 || true
+  return 1
+}
+
+# Subshell-scoped traps retain locals. Explicit status checks also work in
+# if/|| contexts, where Bash's errexit option does not protect function bodies.
+restore_backup() (
+  require_root
+  local name=${1:-} target work="" changed=0 committed=0 f section id unit port state enabled
+  local -A current_ports=() target_ports=() active_before=() enabled_before=()
+  local -a units=()
+  if [[ -z $name ]]; then
+    list_backups || return 1
+    name=$(ask "还原备份" "输入备份文件名（不含路径）" "") || return $?
+  fi
+  target="$BACKUP_DIR/$name"
+  [[ $name =~ ^hy2m-[A-Za-z0-9._-]+\.tar\.gz$ && -f $target && ! -L $target && ! -L $BACKUP_DIR ]] || { warn "找不到安全的备份文件。"; return 1; }
+  work=$(mktemp -d "$BACKUP_DIR/.restore.XXXXXX") || return 1
+  # shellcheck disable=SC2317
+  restore_cleanup() {
+    local result=$? good=1 u
+    trap - EXIT INT TERM
+    if ((changed && !committed)); then
+      for u in "${units[@]}"; do systemctl stop "$u" >/dev/null 2>&1 || good=0; done
+      restore_files "$work/before" || good=0
+      systemctl daemon-reload || good=0
+      for u in "${units[@]}"; do
+        case ${enabled_before[$u]} in
+          enabled) systemctl enable "$u" >/dev/null 2>&1 || good=0 ;;
+          disabled) systemctl disable "$u" >/dev/null 2>&1 || good=0 ;;
+        esac
+        if [[ ${active_before[$u]} == active ]]; then
+          restart_unit_checked "$u" "${current_ports[$u]:-${target_ports[$u]:-0}}" || good=0
+        fi
+      done
+      if ((good)); then warn "还原失败，已恢复操作前的文件与服务状态。"
+      else warn "还原失败且回滚未完全成功；恢复材料保留在：$work"; fi
+      ((result != 0)) || result=1
+    fi
+    if ((good)); then rm -rf -- "$work"; fi
+    exit "$result"
+  }
+  trap restore_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  backup_archive stage "$target" "$work/new" || return 1
+  backup_archive inventory '' >"$work/current.tsv" || return 1
+  # Configuration alone cannot safely replay a changed firewall ownership ledger.
+  if ! cmp -s <( [[ ! -f $FIREWALL_STATE ]] || sort "$FIREWALL_STATE" ) <( [[ ! -f $work/new/state/firewall.rules ]] || sort "$work/new/state/firewall.rules" ); then
+    warn "备份与当前防火墙记录不同，未修改配置；请先人工核对端口规则后再还原。"; return 1
+  fi
+  while IFS=$'\t' read -r id unit port; do current_ports[$unit]=$port; done <"$work/current.tsv"
+  while IFS=$'\t' read -r id unit port; do target_ports[$unit]=$port; done <"$work/new/plan.tsv"
+  for unit in "${!current_ports[@]}" "${!target_ports[@]}"; do
+    [[ -z ${active_before[$unit]+x} ]] || continue
+    units+=("$unit")
+    state=$(systemctl is-active "$unit" 2>/dev/null) || true
+    enabled=$(systemctl is-enabled "$unit" 2>/dev/null) || true
+    case $state in active|inactive|failed|unknown) ;; *) warn "节点服务状态不稳定，未进行还原。"; return 1 ;; esac
+    case $enabled in enabled|disabled|static|indirect|not-found|'') ;; *) warn "节点启用状态不支持自动还原，未修改配置。"; return 1 ;; esac
+    active_before[$unit]=$state; enabled_before[$unit]=${enabled:-not-found}
+  done
+  confirm "还原 $name？先备份当前配置；只重启原来运行的节点，新恢复节点保持停止。" || return 0
+  make_backup || { warn "安全备份失败，已中止还原；当前配置未修改。"; return 1; }
+  mkdir -p "$work/before/services" || return 1
+  for section in state hysteria export; do
+    case $section in state) f=$STATE_DIR ;; hysteria) f=$HYSTERIA_DIR ;; export) f=$EXPORT_DIR ;; esac
+    [[ ! -d $f ]] || cp -a "$f" "$work/before/$section" || return 1
+  done
+  while IFS= read -r f; do cp -p "$f" "$work/before/services/${f##*/}" || return 1; done < <(managed_service_files)
+  [[ ! -f $RENEWAL_HOOK ]] || cp -p "$RENEWAL_HOOK" "$work/before/renewal-hook" || return 1
+  changed=1
+  for unit in "${units[@]}"; do
+    if [[ ${active_before[$unit]} == active ]]; then systemctl stop "$unit" || return 1; fi
+    if [[ -z ${target_ports[$unit]+x} ]]; then systemctl disable "$unit" >/dev/null || return 1; fi
+  done
+  restore_files "$work/new" || return 1
+  systemctl daemon-reload || return 1
+  local restarted=0
+  for unit in "${!target_ports[@]}"; do
+    if [[ ${active_before[$unit]} == active && -n ${current_ports[$unit]+x} ]]; then
+      restart_unit_checked "$unit" "${target_ports[$unit]}" || return 1
+      restarted=$((restarted+1))
+    fi
+  done
+  committed=1
+  ok "已还原 $name，重启 $restarted 个原运行节点；原停止及新恢复节点保持停止。"
+)
 
 public_port_free() {
   local port=$1 f
@@ -224,6 +595,7 @@ public_port_free() {
   for f in "$NODE_DIR"/*.env; do grep -Fxq "PUBLIC_PORT=$port" "$f" && return 1; done
   return 0
 }
+node_port_free() { port_free "$1" udp && recorded_port_free "$1" LISTEN_PORT "${2:-}"; }
 port_free() {
   local port=$1 proto=$2
   if [[ $proto == udp ]]; then
@@ -234,20 +606,40 @@ port_free() {
   return 0
 }
 open_firewall() {
-  local port=$1 proto=$2 rule
+  local port=$1 proto=$2 rule status tmp
   rule="$port/$proto"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    if ufw status | awk '{print $1}' | grep -Fxq "$rule"; then return; fi
-    ufw allow "$rule" >/dev/null
-    printf '%s\n' "$rule" >>"$FIREWALL_STATE"; chmod 600 "$FIREWALL_STATE"
+  command -v ufw >/dev/null 2>&1 || return 0
+  status=$(LC_ALL=C ufw status) || return 1
+  grep -q '^Status: active' <<<"$status" || return 0
+  if awk '{print $1}' <<<"$status" | grep -Fxq "$rule"; then return 0; fi
+  # Persist ownership before mutation: even a partially failing UFW operation
+  # remains discoverable and removable by a later retry/uninstall.
+  tmp=$(mktemp "$STATE_DIR/.firewall.XXXXXXXX") || return 1
+  cleanup_files+=("$tmp")
+  if [[ -f $FIREWALL_STATE ]]; then cat "$FIREWALL_STATE" >"$tmp" || return 1; fi
+  if ! grep -Fxq "$rule" "$tmp"; then printf '%s\n' "$rule" >>"$tmp" || return 1; fi
+  chmod 600 "$tmp" && mv -f -- "$tmp" "$FIREWALL_STATE" || return 1
+  if ! ufw allow "$rule" >/dev/null; then
+    warn "开放 $rule 失败，正在撤销；清理失败时保留归属记录。"
+    close_firewall "$port" "$proto" || true
+    return 1
   fi
 }
 close_firewall() {
-  local port=$1 proto=$2 rule tmp
+  local port=$1 proto=$2 rule tmp status
   rule="$port/$proto"
   [[ -r $FIREWALL_STATE ]] && grep -Fxq "$rule" "$FIREWALL_STATE" || return 0
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw --force delete allow "$rule" >/dev/null 2>&1 || true; fi
-  tmp=$(mktemp); cleanup_files+=("$tmp"); grep -Fxv "$rule" "$FIREWALL_STATE" >"$tmp" || true; install -o root -g root -m 600 "$tmp" "$FIREWALL_STATE"
+  command -v ufw >/dev/null 2>&1 || { warn "UFW 不可用，保留 $rule 归属记录。"; return 1; }
+  status=$(LC_ALL=C ufw status) || return 1
+  # Deleting a persisted rule also matters while UFW is disabled.
+  [[ $status == *'Status: active'* || $status == *'Status: inactive'* ]] || return 1
+  ufw --force delete allow "$rule" >/dev/null 2>&1 || { warn "删除 $rule 失败，归属记录已保留。"; return 1; }
+  tmp=$(mktemp "$STATE_DIR/.firewall.XXXXXX") || return 1
+  cleanup_files+=("$tmp")
+  local rc=0
+  grep -Fxv "$rule" "$FIREWALL_STATE" >"$tmp" || rc=$?
+  ((rc <= 1)) || return 1
+  chmod 600 "$tmp" && mv -f -- "$tmp" "$FIREWALL_STATE"
 }
 
 is_restricted_container() {
@@ -297,43 +689,351 @@ check_dns() {
   if ! grep -Fxq "$expected" <<<"$resolved"; then warn "域名解析不匹配。期望 $expected，实际：$resolved"; return 1; fi
 }
 
+# Transaction snapshots distinguish absent files from failed copies. Never infer
+# absence from an incomplete snapshot, including when errexit is disabled by if/||.
+transaction_path_safe() {
+  python3 - "$@" <<'PY'
+from pathlib import Path
+import sys
+root, *targets = map(Path, sys.argv[1:])
+if not root.is_absolute() or root.resolve() != root.absolute():
+    raise SystemExit('拒绝不安全的事务根目录')
+for target in targets:
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        raise SystemExit('事务文件不在管理目录内')
+    if not rel.parts or '..' in rel.parts:
+        raise SystemExit('拒绝不安全的事务路径')
+    for i in range(1, len(rel.parts) + 1):
+        part = root.joinpath(*rel.parts[:i])
+        if part.is_symlink():
+            raise SystemExit('拒绝符号链接事务路径')
+        if i < len(rel.parts) and part.exists() and not part.is_dir():
+            raise SystemExit('事务父路径不是目录')
+    if target.exists() and not target.is_file():
+        raise SystemExit('事务目标不是普通文件')
+PY
+}
+transaction_snapshot_file() {
+  local work=$1 name=$2 target=$3
+  if [[ -e $target || -L $target ]]; then
+    [[ -f $target && ! -L $target ]] && cp -p -- "$target" "$work/$name.state" || return 1
+  else
+    : >"$work/$name.absent" || return 1
+  fi
+}
+transaction_restore_file() {
+  local work=$1 name=$2 target=$3 mode=$4 group=$5
+  if [[ -f $work/$name.state ]]; then
+    [[ -f $target ]] && cmp -s -- "$work/$name.state" "$target" && return 0
+    install_owned "$mode" "$group" "$work/$name.state" "$target"
+  elif [[ -f $work/$name.absent ]]; then
+    rm -f -- "$target"
+  else
+    warn "恢复材料不完整：$work/$name；未覆盖目标文件。"; return 1
+  fi
+}
+certificate_snapshot() {
+  local work=$1
+  transaction_path_safe "$STATE_DIR" "$CF_CREDENTIALS" "$FIREWALL_STATE" "$MANAGER_STATE" &&
+    transaction_path_safe "$HYSTERIA_DIR" "$TLS_DIR/fullchain.pem" "$TLS_DIR/privkey.pem" &&
+    transaction_path_safe "$LETSENCRYPT_DIR" "$RENEWAL_HOOK" || return 1
+  transaction_snapshot_file "$work" manager.env "$MANAGER_STATE" &&
+    transaction_snapshot_file "$work" fullchain.pem "$TLS_DIR/fullchain.pem" &&
+    transaction_snapshot_file "$work" privkey.pem "$TLS_DIR/privkey.pem" &&
+    transaction_snapshot_file "$work" cloudflare.ini "$CF_CREDENTIALS" &&
+    transaction_snapshot_file "$work" renewal-hook "$RENEWAL_HOOK" &&
+    transaction_snapshot_file "$work" firewall.rules "$FIREWALL_STATE"
+}
+certificate_rollback() {
+  local work=$1 restored=1 firewall_restored=1
+  if ((${_domain_http80_added:-0})); then
+    if ufw --force delete allow 80/tcp >/dev/null 2>&1; then
+      _domain_http80_added=0
+    else
+      warn "HTTP 80 规则回滚失败，请人工检查 UFW；归属记录保留在 $work/http80.pending。"
+      restored=0; firewall_restored=0
+      # Keep the live ownership ledger accurate too; the durable pending marker
+      # remains authoritative if this write fails (e.g. a read-only filesystem).
+      if [[ -f $work/firewall.rules.state ]]; then
+        cp -p -- "$work/firewall.rules.state" "$work/firewall.pending" || restored=0
+      else : >"$work/firewall.pending" || restored=0; fi
+      if ! grep -Fxq '80/tcp' "$work/firewall.pending"; then printf '80/tcp\n' >>"$work/firewall.pending" || restored=0; fi
+      install_owned 600 root "$work/firewall.pending" "$FIREWALL_STATE" || restored=0
+    fi
+  fi
+  transaction_restore_file "$work" manager.env "$MANAGER_STATE" 600 root || restored=0
+  transaction_restore_file "$work" fullchain.pem "$TLS_DIR/fullchain.pem" 640 hysteria || restored=0
+  transaction_restore_file "$work" privkey.pem "$TLS_DIR/privkey.pem" 640 hysteria || restored=0
+  transaction_restore_file "$work" cloudflare.ini "$CF_CREDENTIALS" 600 root || restored=0
+  transaction_restore_file "$work" renewal-hook "$RENEWAL_HOOK" 750 root || restored=0
+  if ((firewall_restored)); then transaction_restore_file "$work" firewall.rules "$FIREWALL_STATE" 600 root || restored=0; fi
+  if ((${_certificate_timer_touched:-0})); then
+    if [[ $(<"$work/timer.active") == inactive ]]; then systemctl stop certbot.timer >/dev/null 2>&1 || restored=0; fi
+    case $(<"$work/timer.enabled") in
+      disabled) systemctl disable certbot.timer >/dev/null 2>&1 || restored=0 ;;
+      enabled-runtime)
+        systemctl disable certbot.timer >/dev/null 2>&1 || restored=0
+        systemctl enable --runtime certbot.timer >/dev/null 2>&1 || restored=0 ;;
+    esac
+    if [[ $(<"$work/timer.active") == active ]]; then systemctl start certbot.timer >/dev/null 2>&1 || restored=0; fi
+  fi
+  ((restored))
+}
+certificate_enable_timer() {
+  local enabled active
+  enabled=$(systemctl is-enabled certbot.timer 2>/dev/null) || true
+  active=$(systemctl is-active certbot.timer 2>/dev/null) || true
+  case $enabled in enabled|enabled-runtime|disabled|static) ;; *) warn "无法安全变更 certbot.timer 的启用状态：$enabled"; return 1 ;; esac
+  case $active in active|inactive) ;; *) warn "无法安全变更 certbot.timer 的运行状态：$active"; return 1 ;; esac
+  printf '%s\n' "$enabled" >"$_certificate_work/timer.enabled" &&
+    printf '%s\n' "$active" >"$_certificate_work/timer.active" || return 1
+  _certificate_timer_touched=1
+  systemctl enable --now certbot.timer >/dev/null 2>&1 || { warn "certbot.timer 启用失败。"; return 1; }
+}
+certificate_transaction() (
+  local work committed=0 ready=0 restored=1
+  # Dynamically scoped into synchronous helpers inside this subshell.
+  # shellcheck disable=SC2030
+  local _certificate_transaction=1 _domain_http80_added=0 _certificate_timer_touched=0
+  # Validate before mktemp as well, so a redirected state directory cannot create
+  # journals outside the managed tree. The complete snapshot is validated below.
+  transaction_path_safe "$STATE_DIR" "$MANAGER_STATE" || return 1
+  work=$(mktemp -d "$STATE_DIR/.certificate.XXXXXX") || return 1
+  # shellcheck disable=SC2030
+  local _certificate_work=$work
+  # shellcheck disable=SC2317
+  certificate_cleanup() {
+    local rc=$?
+    trap - EXIT; trap '' INT TERM
+    if ((ready && !committed)); then
+      certificate_rollback "$work" || restored=0
+      if ((restored)); then warn "证书步骤未完成，已恢复管理文件和本次防火墙/定时器改动。"
+      else warn "证书步骤未完成，自动恢复未完成；恢复材料保留在：$work"; fi
+      warn "Certbot 的账户、日志或已签发证书可能保留；未自动删除 ACME 数据。"
+      ((rc >= 128)) || rc=1
+    fi
+    if ((restored)); then rm -rf -- "$work" || rc=1; fi
+    cleanup || rc=1
+    exit "$rc"
+  }
+  trap certificate_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  certificate_snapshot "$work" || { warn "证书快照失败，未开始变更。"; return 1; }
+  ready=1
+  if "$@"; then committed=1; else return $?; fi
+)
 certificate_http() {
-  local domain=$1 email=$2
+  # shellcheck disable=SC2031
+  if [[ ${_certificate_transaction:-0} == 1 ]]; then _certificate_http "$@"
+  else certificate_transaction _certificate_http "$@"; fi
+}
+# Issuance plus deployment as one unit: a failure while writing the key, hook or
+# timer must not leave the old certificate half replaced.
+_domain_certificate_stage() {
+  certificate_transaction _domain_certificate_stage_impl "$@"
+}
+_domain_certificate_stage_impl() {
+  local domain=$1 cert_mode=$2 email=$3 token=""
+  if certificate_valid "$domain"; then
+    ok "检测到 30 天以上有效期的现有证书，将安全复用。"
+    copy_certificate "$domain" --no-timer
+    return $?
+  fi
+  if [[ $cert_mode == http ]]; then
+    certificate_http "$domain" "$email" || { warn "HTTP-01 证书签发失败。"; return 1; }
+  else
+    token=$(ask_secret "Cloudflare" "请输入仅含 Zone.DNS Edit 权限的 API Token") || return $?
+    [[ -n $token ]] || { warn "Token 不能为空。"; return 1; }
+    if ! certificate_cloudflare "$domain" "$email" "$token"; then
+      unset token; warn "DNS-01 证书签发失败。"; return 1
+    fi
+    unset token
+  fi
+  copy_certificate "$domain" --no-timer || { warn "证书部署失败。"; return 1; }
+}
+_certificate_http() {
+  # shellcheck disable=SC2031
+  local domain=$1 email=$2 firewall_status tmp="$_certificate_work/firewall.next" rc
+  valid_domain "$domain" || return 1
   if ! port_free 80 tcp; then warn "内部 TCP 80 被占用，无法使用 HTTP-01。"; return 1; fi
-  open_firewall 80 tcp
-  local args=(certonly --standalone --preferred-challenges http --non-interactive --agree-tos -d "$domain")
+  if command -v ufw >/dev/null 2>&1; then
+    firewall_status=$(LC_ALL=C ufw status) || { warn "无法读取 UFW 状态。"; return 1; }
+    # Preserve restricted/deny rules, multiports/ranges and IPv6. An application
+    # profile may also include 80: conservatively leave its policy unchanged.
+    if grep -q '^Status: active' <<<"$firewall_status" && ! awk '
+      /ALLOW|DENY|REJECT|LIMIT/ {
+        port=$1
+        if (port !~ /^[0-9]/) {found=1; next}
+        if (port ~ /\/udp$/) next
+        sub(/\/tcp$/, "", port)
+        n=split(port, parts, ",")
+        for (i=1; i<=n; i++) {
+          m=split(parts[i], ends, ":")
+          if ((m==1 && ends[1]==80) || (m==2 && ends[1]<=80 && ends[2]>=80)) found=1
+        }
+      } END {exit !found}' <<<"$firewall_status"; then
+      if [[ -e $FIREWALL_STATE ]]; then cp -p -- "$FIREWALL_STATE" "$tmp" || return 1
+      else : >"$tmp" || return 1; fi
+      if ! grep -Fxq '80/tcp' "$tmp"; then
+        [[ ! -s $tmp || -z $(tail -c 1 -- "$tmp") ]] || printf '\n' >>"$tmp" || return 1
+        printf '80/tcp\n' >>"$tmp" || return 1
+      fi
+      chmod 600 "$tmp" || return 1
+      # Journal before mutation, including allow failures that partially apply.
+      # shellcheck disable=SC2031
+      printf '80/tcp\n' >"$_certificate_work/http80.pending" || return 1
+      _domain_http80_added=1
+      ufw allow 80/tcp >/dev/null || return 1
+    fi
+  fi
+  local args=(certonly --no-directory-hooks --config-dir "$LETSENCRYPT_DIR" --work-dir "$LETSENCRYPT_DIR/work" --logs-dir "$LETSENCRYPT_DIR/logs" --standalone --preferred-challenges http --non-interactive --agree-tos -d "$domain")
   [[ -n $email ]] && args+=(--email "$email") || args+=(--register-unsafely-without-email)
-  certbot "${args[@]}" || { warn "HTTP-01 证书签发失败。"; return 1; }
+  if certbot "${args[@]}"; then :; else
+    rc=$?; warn "HTTP-01 证书签发失败。"; return "$rc"
+  fi
+  if ((_domain_http80_added)); then
+    if [[ ! -f $tmp ]]; then
+      if [[ -f $FIREWALL_STATE ]]; then cp -p -- "$FIREWALL_STATE" "$tmp" || return 1; else : >"$tmp" || return 1; fi
+      grep -Fxq '80/tcp' "$tmp" || printf '80/tcp\n' >>"$tmp" || return 1
+    fi
+    mv -f -- "$tmp" "$FIREWALL_STATE" || return 1
+  fi
+  return 0
 }
 certificate_valid() {
-  local domain=$1 live="/etc/letsencrypt/live/$1/fullchain.pem"
-  [[ -r $live ]] && openssl x509 -in "$live" -noout -checkend 2592000 >/dev/null 2>&1 && openssl x509 -in "$live" -noout -ext subjectAltName 2>/dev/null | grep -Fq "DNS:$domain"
+  local domain=$1 live="$LETSENCRYPT_DIR/live/$1/fullchain.pem"
+  valid_domain "$domain" || return 1
+  [[ -r $live ]] && openssl x509 -in "$live" -noout -checkend 2592000 >/dev/null 2>&1 &&
+    openssl x509 -in "$live" -noout -checkhost "$domain" >/dev/null 2>&1
 }
 certificate_cloudflare() {
-  local domain=$1 email=$2 token=$3
+  # shellcheck disable=SC2031
+  if [[ ${_certificate_transaction:-0} == 1 ]]; then _certificate_cloudflare "$@"
+  else certificate_transaction _certificate_cloudflare "$@"; fi
+}
+_certificate_cloudflare() {
+  local domain=$1 email=$2 token=$3 tmp rc
+  valid_domain "$domain" && [[ -n $token && $token != *$'\n'* && $token != *$'\r'* ]] || return 1
+  [[ ! -L $STATE_DIR && ! -L $CF_CREDENTIALS ]] || { warn "拒绝符号链接凭据文件。"; return 1; }
+  transaction_path_safe "$STATE_DIR" "$CF_CREDENTIALS" || { warn "拒绝不安全的凭据路径。"; return 1; }
   export DEBIAN_FRONTEND=noninteractive
   apt-get install -y --no-install-recommends python3-certbot-dns-cloudflare || { warn "Cloudflare DNS 插件安装失败。"; return 1; }
-  printf 'dns_cloudflare_api_token = %s\n' "$token" >"$CF_CREDENTIALS"; chmod 600 "$CF_CREDENTIALS"
-  local args=(certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CREDENTIALS" --dns-cloudflare-propagation-seconds 30 --non-interactive --agree-tos -d "$domain")
+  tmp=$(mktemp "$STATE_DIR/.cloudflare.XXXXXX") || return 1
+  if ! printf 'dns_cloudflare_api_token = %s\n' "$token" >"$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$CF_CREDENTIALS"; then
+    rm -f -- "$tmp"; return 1
+  fi
+  local args=(certonly --no-directory-hooks --config-dir "$LETSENCRYPT_DIR" --work-dir "$LETSENCRYPT_DIR/work" --logs-dir "$LETSENCRYPT_DIR/logs" --dns-cloudflare --dns-cloudflare-credentials "$CF_CREDENTIALS" --dns-cloudflare-propagation-seconds 30 --non-interactive --agree-tos -d "$domain")
   [[ -n $email ]] && args+=(--email "$email") || args+=(--register-unsafely-without-email)
-  certbot "${args[@]}" || { warn "Cloudflare DNS-01 证书签发失败，请检查 Token、Zone 权限和 DNS。"; return 1; }
+  certbot "${args[@]}"; rc=$?
+  ((rc == 0)) && return 0
+  warn "Cloudflare DNS-01 证书签发失败，请检查 Token、Zone 权限和 DNS。"; return "$rc"
 }
 copy_certificate() {
-  local domain=$1 live
-  live="/etc/letsencrypt/live/$domain"
-  [[ -r $live/fullchain.pem && -r $live/privkey.pem ]] || die "找不到证书：$live"
-  install -o root -g hysteria -m 640 "$live/fullchain.pem" "$TLS_DIR/fullchain.pem"
-  install -o root -g hysteria -m 640 "$live/privkey.pem" "$TLS_DIR/privkey.pem"
-  install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
-  cat >/etc/letsencrypt/renewal-hooks/deploy/hy2-manager-copy.sh <<EOF
-#!/usr/bin/env bash
-set -Eeuo pipefail
-case " \${RENEWED_DOMAINS:-} " in *" $domain "*) ;; *) exit 0 ;; esac
-install -o root -g hysteria -m 640 "\$RENEWED_LINEAGE/fullchain.pem" "$TLS_DIR/fullchain.pem"
-install -o root -g hysteria -m 640 "\$RENEWED_LINEAGE/privkey.pem" "$TLS_DIR/privkey.pem"
-EOF
-  chmod 750 /etc/letsencrypt/renewal-hooks/deploy/hy2-manager-copy.sh
-  systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+  # shellcheck disable=SC2031
+  if [[ ${_certificate_transaction:-0} == 1 ]]; then _copy_certificate "$@"
+  else certificate_transaction _copy_certificate "$@"; fi
+}
+_copy_certificate() {
+  local domain=$1 live cert_key private_key tmp
+  valid_domain "$domain" || return 1
+  live="$LETSENCRYPT_DIR/live/$domain"
+  # ACME live files normally link into archive/. Permit only those source links;
+  # managed destinations and their parent directories must not be symlinks.
+  if ! python3 - "$LETSENCRYPT_DIR" "$HYSTERIA_DIR" "$TLS_DIR" "$RENEWAL_HOOK" "$live" <<'PY'
+from pathlib import Path
+import sys
+le, hy, tls, hook, live = map(Path, sys.argv[1:])
+for root, target in [(hy, tls / 'fullchain.pem'), (hy, tls / 'privkey.pem'), (le, hook)]:
+    if not root.is_absolute() or root.resolve() != root.absolute():
+        raise SystemExit('拒绝不安全的证书根目录')
+    rel = target.relative_to(root)
+    for part in [root, *[root.joinpath(*rel.parts[:i]) for i in range(1, len(rel.parts) + 1)]]:
+        if part.is_symlink():
+            raise SystemExit('拒绝符号链接证书目标')
+    if target.exists() and not target.is_file():
+        raise SystemExit('证书目标不是普通文件')
+for filename in ['fullchain.pem', 'privkey.pem']:
+    source = live / filename
+    if not source.is_file() or not source.resolve().is_relative_to(le.resolve()):
+        raise SystemExit('证书来源不在管理的 ACME 目录中')
+PY
+  then return 1; fi
+  openssl x509 -in "$live/fullchain.pem" -noout -checkend 0 -checkhost "$domain" >/dev/null 2>&1 || { warn "证书无效或域名不匹配。"; return 1; }
+  cert_key=$(openssl x509 -in "$live/fullchain.pem" -pubkey -noout) || return 1
+  private_key=$(openssl pkey -in "$live/privkey.pem" -pubout) || return 1
+  [[ -n $cert_key && $cert_key == "$private_key" ]] || { warn "证书与私钥不匹配。"; return 1; }
+  install_dir 750 hysteria "$TLS_DIR" || return 1
+  install_owned 640 hysteria "$live/fullchain.pem" "$TLS_DIR/fullchain.pem" || return 1
+  install_owned 640 hysteria "$live/privkey.pem" "$TLS_DIR/privkey.pem" || return 1
+  install_dir 755 root "${RENEWAL_HOOK%/*}" || return 1
+  tmp=$(mktemp "${RENEWAL_HOOK%/*}/.hy2-copy.XXXXXX") || return 1
+  if ! {
+    printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+    printf 'domain=%q\ntls_dir=%q\nle_dir=%q\n' "$domain" "$TLS_DIR" "$LETSENCRYPT_DIR"
+    printf 'manager=%q\n' "$APP_DIR/hy2-manager"
+    cat <<'HOOK'
+# hysteria certificate deployment is serialized and transactional in the manager.
+case " ${RENEWED_DOMAINS:-} " in *" $domain "*) ;; *) exit 0 ;; esac
+[[ ${RENEWED_LINEAGE:-} == "$le_dir/live/$domain" ]] || exit 1
+exec "$manager" renew-certificate
+HOOK
+  } >"$tmp"; then rm -f -- "$tmp"; return 1; fi
+  if ! install_owned 750 root "$tmp" "$RENEWAL_HOOK"; then rm -f -- "$tmp"; return 1; fi
+  rm -f -- "$tmp" || return 1
+  # Installation retains its one-argument API. Migration must not change timers.
+  if [[ ${2:-} != --no-timer ]]; then
+    certificate_enable_timer || { warn "证书已复制，但 certbot.timer 启用失败。"; return 1; }
+  fi
+}
+
+renew_certificate() (
+  load_manager
+  [[ ${RENEWED_LINEAGE:-} == "$LETSENCRYPT_DIR/live/$DOMAIN" ]] || { warn "续期来源与当前域名不一致。"; return 1; }
+  renewal_units=(); renewal_ports=(); renewal_committed=0
+  local f unit port state
+  shopt -s nullglob
+  for f in "$NODE_DIR"/*.env; do
+    unit=$(env_get "$f" SERVICE); port=$(env_get "$f" LISTEN_PORT)
+    state=$(systemctl is-active "$unit" 2>/dev/null) || true
+    case $state in
+      active) renewal_units+=("$unit"); renewal_ports+=("$port") ;;
+      inactive|failed) ;;
+      *) warn "服务状态不稳定，暂缓续期部署：$unit"; return 1 ;;
+    esac
+  done
+  # The inner certificate transaction restores files before this EXIT handler
+  # restores the running processes. Stopped services are never started.
+  # shellcheck disable=SC2317
+  renewal_cleanup() {
+    local rc=$? i restored=1
+    trap - EXIT; trap '' INT TERM
+    if ((!renewal_committed)); then
+      for ((i=0; i<${#renewal_units[@]}; i++)); do
+        restart_unit_checked "${renewal_units[i]}" "${renewal_ports[i]}" || restored=0
+      done
+      ((restored)) || warn "续期后服务恢复失败，请检查日志及保留的证书快照。"
+      ((rc != 0)) || rc=1
+    fi
+    exit "$rc"
+  }
+  trap renewal_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  local -a targets=()
+  local i
+  for ((i=0; i<${#renewal_units[@]}; i++)); do targets+=("${renewal_units[i]}" "${renewal_ports[i]}"); done
+  certificate_transaction _renew_certificate_impl "${targets[@]}" || return $?
+  renewal_committed=1
+)
+_renew_certificate_impl() {
+  _copy_certificate "$DOMAIN" --no-timer || return 1
+  while (($# >= 2)); do
+    restart_unit_checked "$1" "$2" || return 1
+    shift 2
+  done
 }
 
 write_service() {
@@ -371,6 +1071,7 @@ EOF
   cat >>"$SERVICE_DIR/$service" <<EOF
 Nice=-5
 LimitNOFILE=1048576
+IPAccounting=true
 Restart=on-failure
 RestartSec=3
 
@@ -439,7 +1140,7 @@ create_direct() {
   mode=$NETWORK_MODE
   while true; do
     listen_port=$(ask_valid_port "直连节点" "VPS 内部 UDP 监听端口" "443") || return $?
-    if port_free "$listen_port" udp; then break; fi
+    if node_port_free "$listen_port"; then break; fi
     warn "UDP $listen_port 已占用，请重新输入。"
   done
   if [[ $mode == nat ]]; then
@@ -594,7 +1295,7 @@ create_isp() {
   mode=$NETWORK_MODE; listen_default=$((7443 + index * 1000))
   while true; do
     listen_port=$(ask_valid_port "ISP 全局节点" "VPS 内部 UDP 监听端口" "$listen_default") || return $?
-    if port_free "$listen_port" udp; then break; fi
+    if node_port_free "$listen_port"; then break; fi
     warn "UDP $listen_port 已占用，请重新输入。"
   done
   if [[ $mode == nat ]]; then
@@ -678,7 +1379,7 @@ change_node_port() (
   old_listen=$LISTEN_PORT; old_public=$PUBLIC_PORT
   while true; do
     new_listen=$(ask_valid_port "修改 $NAME" "内部 UDP 端口" "$old_listen") || return $?
-    if [[ $new_listen == "$old_listen" ]] || { port_free "$new_listen" udp && recorded_port_free "$new_listen" LISTEN_PORT "$id"; }; then break; fi
+    if [[ $new_listen == "$old_listen" ]] || { node_port_free "$new_listen" "$id"; }; then break; fi
     warn "该端口被服务或其他节点占用。"
   done
   new_public=$new_listen
@@ -753,6 +1454,271 @@ PY
   [[ $NETWORK_MODE != nat ]] || warn "请修改服务商映射：公网 UDP $new_public → 内部 UDP $new_listen。"
   ok "端口已更新，密码及 ISP 凭据保持不变，请重新导入节点链接。"
 )
+
+# ---------------- 域名迁移 ----------------
+# 0.2 版把 DOMAIN 写进 manager.env 和每个节点链接，换域名只能重装。
+# 这里做一次事务：新证书就位 → 重写全部链接 → 重启全部节点；任一步失败整体回滚。
+rewrite_node_domain() {
+  local check=0 uri_file
+  if [[ ${1:-} == --check ]]; then check=1; shift; fi
+  uri_file=$1; local old=$2 new=$3 tmp rc
+  tmp=$(mktemp); cleanup_files+=("$tmp")
+  python3 - "$uri_file" "$old" "$new" >"$tmp" <<'PY'
+from pathlib import Path
+import sys
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+path, old, new = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+uri = urlsplit(path.read_text(encoding='utf-8').strip())
+if uri.scheme != 'hysteria2' or not uri.hostname or not uri.username:
+    raise SystemExit('无法识别节点链接，未修改原文件')
+query = [(k, new if k == 'sni' else v) for k, v in parse_qsl(uri.query, keep_blank_values=True)]
+if 'sni' not in dict(query):
+    raise SystemExit('节点链接缺少 sni 参数，未修改原文件')
+credentials = uri.username or ''
+if uri.password is not None:
+    credentials += ':' + uri.password
+authority = credentials + '@' + new + (':' + str(uri.port) if uri.port else '')
+print(urlunsplit(uri._replace(netloc=authority, query=urlencode(query))), end='')
+PY
+  rc=$?
+  # 解析失败时 python3 已把原因写到 stderr，这里必须直接放弃，不能覆盖原链接。
+  if ((rc != 0)) || [[ ! -s $tmp ]]; then rm -f "$tmp"; return 1; fi
+  ((check)) && { rm -f "$tmp"; return 0; }
+  install_owned 600 root "$tmp" "$uri_file"
+}
+
+# Subshell-scoped so the rollback trap cannot outlive this function's locals.
+change_domain() (
+  load_manager
+  local old=$DOMAIN new="" public_ip cert_mode email token="" work id f u
+  local -a node_files=() node_ids=()
+  [[ -n $old ]] || die "当前状态没有记录域名，无法迁移。"
+  new=$(ask_valid_domain "更换域名" "新域名（Cloudflare 必须灰云，解析需指向本机）" "") || return $?
+  [[ $new != "$old" ]] || { ok "域名未改变。"; return 0; }
+  if [[ $NETWORK_MODE == normal ]]; then
+    if ! public_ip=$(get_public_ipv4); then warn "无法获取公网 IPv4。"; return 1; fi
+  else public_ip=$PUBLIC_IP; fi
+  check_dns "$new" "$public_ip" || { confirm "DNS 检查失败，仍要继续吗？选择否将放弃迁移。" || return 0; }
+  cert_mode=$(choose "证书" "新域名需要重新签发证书" http "HTTP-01（需要公网 80→内部80）" cloudflare "Cloudflare DNS-01（适合 NAT）") || return $?
+  [[ $cert_mode == http || $cert_mode == cloudflare ]] || die "证书方式无效。"
+  email=$(ask "证书" "Let's Encrypt 邮箱（可以留空）" "") || return $?
+
+  # 签发证书之前就把所有链接校验一遍：畸形或越界的链接必须在这里失败，
+  # 否则会在证书已经换掉之后才中断，留下新旧混用的状态。
+  shopt -s nullglob
+  node_files=("$NODE_DIR"/*.env)
+  local -A was_active=()
+  local -a link_paths=()
+  for f in "${node_files[@]}"; do
+    id=$(basename "$f" .env)
+    [[ $id =~ ^(direct|isp[0-9]+)$ ]] || { warn "节点文件 $id 不是本管理器创建的，已中止。"; return 1; }
+    u=$(env_get "$f" URI_FILE)
+    [[ -n $u ]] || { warn "节点 $id 没有记录链接文件，已中止。"; return 1; }
+    [[ -f $u && ! -L $u ]] || { warn "节点 $id 的链接文件缺失或不是普通文件，已中止。"; return 1; }
+    # Only manager-created export paths are supported, so rollback can restore
+    # the exact file instead of guessing by name or glob.
+    [[ $u == "$EXPORT_DIR"/* ]] || { warn "节点 $id 的链接文件不在导出目录内，已中止。"; return 1; }
+    transaction_path_safe "$EXPORT_DIR" "$u" || { warn "节点 $id 的链接路径不安全，已中止。"; return 1; }
+    rewrite_node_domain --check "$u" "$old" "$new" >/dev/null || { warn "节点 $id 的链接无法安全改写，已中止；未做任何修改。"; return 1; }
+    # 记下原始运行状态：回滚只恢复原本运行的服务，不擅自拉起已停止的节点。
+    was_active[$id]=$(systemctl is-active "$(env_get "$f" SERVICE)" 2>/dev/null || true)
+    node_ids+=("$id")
+    link_paths+=("$u")
+  done
+  confirm "将把域名从 $old 迁移到 $new：重新签发证书、重建所有节点链接并重启节点。客户端需要重新导入链接，SSH 不受影响。" || return 0
+
+  work=$(mktemp -d "$STATE_DIR/.domain-change.XXXXXX") || { warn "无法创建迁移快照目录，已中止。"; return 1; }
+  local original snapshot i
+  # Every snapshot is checked explicitly: this function may run inside if/||,
+  # where errexit is disabled and a failed copy would otherwise go unnoticed.
+  for f in "${node_files[@]}"; do
+    transaction_snapshot_file "$work" "node.${f##*/}" "$f" || { warn "无法备份节点文件：$f；迁移已中止。"; rm -rf -- "$work"; return 1; }
+  done
+  transaction_snapshot_file "$work" manager.env "$MANAGER_STATE" || { warn "无法备份管理器状态；迁移已中止。"; rm -rf -- "$work"; return 1; }
+  for original in "$TLS_DIR/fullchain.pem" "$TLS_DIR/privkey.pem" "$CF_CREDENTIALS" "$RENEWAL_HOOK"; do
+    case $original in
+      "$TLS_DIR/fullchain.pem") snapshot=fullchain.pem ;;
+      "$TLS_DIR/privkey.pem") snapshot=privkey.pem ;;
+      "$CF_CREDENTIALS") snapshot=cloudflare.ini ;;
+      "$RENEWAL_HOOK") snapshot=renewal-hook ;;
+    esac
+    transaction_snapshot_file "$work" "$snapshot" "$original" || {
+      warn "无法安全备份原文件：$original；迁移已中止。"; rm -rf -- "$work"; return 1; }
+  done
+  transaction_snapshot_file "$work" firewall.rules "$FIREWALL_STATE" || { warn "无法安全备份防火墙记录；迁移已中止。"; rm -rf -- "$work"; return 1; }
+  for ((i = 0; i < ${#link_paths[@]}; i++)); do
+    transaction_snapshot_file "$work" "link.$i" "${link_paths[i]}" || { warn "无法备份链接文件：${link_paths[i]}；迁移已中止。"; rm -rf -- "$work"; return 1; }
+    printf '%s\n' "${link_paths[i]}" >"$work/link.$i.path" || { warn "无法记录链接路径；迁移已中止。"; rm -rf -- "$work"; return 1; }
+  done
+  local committed=0 _domain_http80_added=0
+  # The nested certificate transaction owns its own scope, so its HTTP rule
+  # flag cannot reach us. Re-derive ownership from the ledger we snapshotted.
+  domain_stage_owned_http80() {
+    [[ -r $FIREWALL_STATE ]] && grep -Fxq '80/tcp' "$FIREWALL_STATE" || return 1
+    [[ ! -f $work/firewall.rules.state ]] || ! grep -Fxq '80/tcp' "$work/firewall.rules.state"
+  }
+  # Called by EXIT/INT/TERM rather than a direct function invocation.
+  # shellcheck disable=SC2317
+  domain_change_cleanup() {
+    local rc=$? restored=1
+    trap - EXIT INT TERM
+    if ((committed == 0)); then
+      local s base target snapshot mode group
+      # Revoke an HTTP rule this transaction opened before restoring its ledger;
+      # if UFW refuses, keep the record instead of losing track of the open port.
+      if ((_domain_http80_added)); then
+        if ufw --force delete allow 80/tcp >/dev/null 2>&1; then
+          _domain_http80_added=0
+          transaction_restore_file "$work" firewall.rules "$FIREWALL_STATE" 600 root || restored=0
+        else
+          warn "HTTP 80 规则回滚失败，请人工检查 UFW；归属记录已保留。"
+          restored=0
+        fi
+      else
+        transaction_restore_file "$work" firewall.rules "$FIREWALL_STATE" 600 root || restored=0
+      fi
+      for s in "$work"/*.state "$work"/*.absent; do
+        [[ -e $s ]] || continue
+        base=${s##*/}; base=${base%.*}
+        case $base in
+          manager.env) target=$MANAGER_STATE; mode=600; group=root ;;
+          fullchain.pem) target=$TLS_DIR/fullchain.pem; mode=640; group=hysteria ;;
+          privkey.pem) target=$TLS_DIR/privkey.pem; mode=640; group=hysteria ;;
+          cloudflare.ini) target=$CF_CREDENTIALS; mode=600; group=root ;;
+          renewal-hook) target=$RENEWAL_HOOK; mode=750; group=root ;;
+          firewall.rules) continue ;;
+          node.*) target=$NODE_DIR/${base#node.}; mode=600; group=root ;;
+          link.*) target=$(<"$work/$base.path"); mode=600; group=root ;;
+          *) continue ;;
+        esac
+        transaction_restore_file "$work" "$base" "$target" "$mode" "$group" || restored=0
+      done
+      for id in "${node_ids[@]}"; do
+        [[ ${was_active[$id]} == active ]] || continue
+        restart_node_now "$id" >/dev/null 2>&1 || restored=0
+      done
+      if ((restored)); then warn "域名迁移未完成，已恢复旧域名、旧证书、旧链接和防火墙规则。"
+      else warn "域名迁移未完成，自动恢复未完成；恢复材料保留在：$work"; fi
+      # 保留 130/143 等信号退出码，让调用方与 systemd 看到真实原因。
+      ((rc >= 128)) || rc=1
+    fi
+    if ((restored)); then rm -rf -- "$work"; fi
+    cleanup
+    exit "$rc"
+  }
+  trap domain_change_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  log "签发 $new 的证书……"
+  # Issuance and deployment form their own nested transaction: on failure the
+  # certificate files, timer and HTTP rule are restored before this function's
+  # rollback handles links, state and services.
+  local stage_rc=0
+  _domain_certificate_stage "$new" "$cert_mode" "$email" || stage_rc=$?
+  if ((stage_rc != 0)); then
+    # A failed rollback inside the nested transaction leaves the rule recorded;
+    # adopt that ownership so our own cleanup still tries to close the port.
+    if domain_stage_owned_http80; then _domain_http80_added=1; fi
+    ((stage_rc >= 128)) && exit "$stage_rc"
+    die "证书签发或部署失败，未做任何修改。"
+  fi
+  # The nested transaction committed, so its HTTP rule outlives it: adopt it
+  # here, otherwise a later failure leaves 80/tcp open after rollback.
+  if domain_stage_owned_http80; then _domain_http80_added=1; fi
+
+  for id in "${node_ids[@]}"; do
+    u=$(env_get "$NODE_DIR/$id.env" URI_FILE)
+    rewrite_node_domain "$u" "$old" "$new" || die "节点 $id 的链接改写失败。"
+  done
+  write_env "$MANAGER_STATE" INSTALLED_VERSION "$APP_VERSION" DOMAIN "$new" PUBLIC_IP "$public_ip" NETWORK_MODE "$NETWORK_MODE" CERT_MODE "$cert_mode" || die "写入管理器状态失败。"
+
+  local restarted=0
+  for id in "${node_ids[@]}"; do
+    [[ ${was_active[$id]} == active ]] || continue
+    restart_node_now "$id" || die "节点 $id 重启失败。"
+    restarted=$((restarted + 1))
+  done
+  committed=1
+  rm -rf -- "$work"
+  ok "域名已切换到 $new，重启 $restarted 个运行中的节点；原停止的节点保持停止。请让客户端重新导入链接。"
+)
+
+# Render on demand from the current URI: no cached YAML to become stale after
+# a port/domain change, rename, restore or deletion. Never read ISP credentials.
+render_clash_config() {
+  python3 - "$1" "$2" <<'PY'
+import json, re, sys
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
+
+try:
+    raw = Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw) or re.search(r'%(?![0-9a-fA-F]{2})', raw):
+        raise ValueError('invalid URI encoding')
+    uri = urlsplit(raw)
+    auth, separator, _ = uri.netloc.rpartition('@')
+    if uri.scheme not in ('hysteria2', 'hy2') or not separator or not uri.hostname or uri.path not in ('', '/'):
+        raise ValueError('unsupported URI')
+    port = uri.port if uri.port is not None else 443
+    if not 1 <= port <= 65535:
+        raise ValueError('invalid port')
+    query = parse_qs(uri.query, keep_blank_values=True, strict_parsing=True, encoding='utf-8', errors='strict')
+    # Manager-generated nodes have no obfuscation/pinning options. Reject rather
+    # than silently dropping security/transport options from a modified URI.
+    if set(query) - {'sni', 'insecure'} or any(len(v) != 1 for v in query.values()):
+        raise ValueError('unsupported or duplicate option')
+    if query.get('insecure', ['0']) != ['0']:
+        raise ValueError('TLS verification must remain enabled')
+    name, server = sys.argv[2], uri.hostname
+    password = unquote(auth, encoding='utf-8', errors='strict')
+    sni = query.get('sni', [server])[0]
+    if any(not value or any(ord(c) < 32 or ord(c) == 127 for c in value)
+           for value in (name, server, password, sni)) or any(c.isspace() for c in server + sni):
+        raise ValueError('empty or unsafe field')
+    # Avoid colliding with Mihomo built-ins or the local selector group.
+    if name.upper() in {'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL'}:
+        name = 'HY2-' + name
+    group = 'HY2-PROXY'
+    while group == name:
+        group += '-OUT'
+    def quoted(value):
+        # ASCII escapes also preserve YAML-sensitive Unicode line separators.
+        return json.dumps(value, ensure_ascii=True)
+    lines = [
+        '# Sensitive HY2 client profile; do not publish or upload to converters.',
+        'mixed-port: 7890', 'allow-lan: false', 'mode: rule', 'log-level: info',
+        'proxies:', '  - name: ' + quoted(name), '    type: hysteria2',
+        '    server: ' + quoted(server), '    port: ' + str(port),
+        '    password: ' + quoted(password), '    sni: ' + quoted(sni),
+        '    skip-cert-verify: false',
+        'proxy-groups:', '  - name: ' + quoted(group), '    type: select',
+        '    proxies:', '      - ' + quoted(name),
+        'rules:', '  - ' + quoted('MATCH,' + group),
+    ]
+except (OSError, UnicodeError, ValueError):
+    print('无法安全导出：链接无效、TLS 校验被关闭或含不支持的参数；未输出配置。', file=sys.stderr)
+    sys.exit(1)
+sys.stdout.reconfigure(encoding='utf-8', newline='\n')
+sys.stdout.write('\n'.join(lines) + '\n')
+PY
+}
+
+# stdout is ONLY the complete profile, so shell redirection produces valid YAML.
+export_clash() (
+  require_root
+  local id=${1:-}
+  [[ -n $id ]] || id=$(select_node) || return $?
+  [[ $id =~ ^(direct|isp[0-9]+)$ ]] || { warn "无效节点。"; return 1; }
+  load_node "$id"
+  [[ -n ${URI_FILE:-} && -r $URI_FILE ]] || { warn "节点没有可读的导入链接。"; return 1; }
+  render_clash_config "$URI_FILE" "$NAME"
+)
+
+show_clash_export() {
+  confirm "显示含 HY2 密码的 Clash.Meta/Mihomo YAML？请勿公开或上传在线转换站。" || return 0
+  export_clash "$1"
+}
 
 show_managed_node() {
   local f=$1 uri
@@ -837,35 +1803,74 @@ remove_node() {
   source "$f"
   confirm "确定删除 ${NAME:-$id}（$id，公网端口 $PUBLIC_PORT）？此节点链接将失效，不影响 SSH。" || return 0
   systemctl disable --now "$SERVICE" || die "停止节点失败，未删除配置。"
-  rm -f "$SERVICE_DIR/$SERVICE" "$CONFIG" "$URI_FILE" "$f"; close_firewall "$LISTEN_PORT" udp; systemctl daemon-reload
-  ok "节点 $id 已删除。"
+  close_firewall "$LISTEN_PORT" udp || die "防火墙清理失败，节点记录已保留以便重试。"
+  rm -f "$SERVICE_DIR/$SERVICE" "$CONFIG" "$URI_FILE" "$f"; systemctl daemon-reload
+  ok "节点 $id 已删除。已导入此链接的客户端会连接失败，请自行清理。"
 }
 
 uninstall_all() {
-  [[ -r $MANAGER_STATE ]] || die "未检测到安装状态。"; confirm "完整卸载本管理器创建的节点？SSH 和其他服务不会被修改。" || return 0
+  [[ -r $MANAGER_STATE ]] || die "未检测到安装状态。"
+  load_manager
+  confirm "完整卸载本管理器创建的节点？SSH 和其他服务不会被修改。" || return 0
+  # 证书和网络优化会波及其他程序，默认不动，只在用户额外确认后清理。
+  local purge=0
+  confirm "同时删除本管理器申请的系统证书和网络优化（sysctl）吗？选否将保留，避免影响其他程序。" && purge=1
   make_backup; local f
   shopt -s nullglob
   for f in "$NODE_DIR"/*.env; do
     unset SERVICE CONFIG URI_FILE LISTEN_PORT
     # shellcheck disable=SC1090
     source "$f"
-    systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true; rm -f "$SERVICE_DIR/$SERVICE" "$CONFIG" "$URI_FILE"; close_firewall "$LISTEN_PORT" udp
+    systemctl disable --now "$SERVICE" >/dev/null 2>&1 || die "停止节点失败，保留配置。"
+    close_firewall "$LISTEN_PORT" udp || die "防火墙清理失败，保留配置和记录。"
+    rm -f "$SERVICE_DIR/$SERVICE" "$CONFIG" "$URI_FILE"
   done
-  if [[ -r $FIREWALL_STATE ]]; then while IFS=/ read -r port proto; do close_firewall "$port" "$proto"; done < <(cp "$FIREWALL_STATE" /dev/stdout); fi
+  if [[ -r $FIREWALL_STATE ]]; then while IFS=/ read -r port proto; do close_firewall "$port" "$proto" || die "防火墙清理失败，保留归属记录。"; done < <(cp "$FIREWALL_STATE" /dev/stdout); fi
   systemctl daemon-reload; rm -rf "$STATE_DIR" "$HYSTERIA_DIR" "$EXPORT_DIR"; rm -f /etc/letsencrypt/renewal-hooks/deploy/hy2-manager-copy.sh
+  if ((purge)); then
+    [[ -z ${DOMAIN:-} ]] || certbot delete --cert-name "$DOMAIN" --non-interactive >/dev/null 2>&1 || warn "证书删除失败，可稍后手动执行 certbot delete --cert-name $DOMAIN。"
+    [[ ! -r $SYSCTL_FILE ]] || rm -f "$SYSCTL_FILE"
+    warn "网络优化文件已删除；已生效的内核参数保持到重启为止，重启后回到系统默认值。"
+  fi
   local shortcut
   for shortcut in "$SBIN_DIR/hy2" "$BIN_DIR/hy2"; do
     if [[ -L $shortcut && $(readlink "$shortcut") == "$APP_DIR/hy2-manager" ]]; then rm -f "$shortcut"; fi
   done
   rm -f "$SBIN_DIR/hy2-manager" "$BIN_DIR/hy2-manager"; rm -rf "$APP_DIR"
-  ok "卸载完成。系统证书账户、网络优化和备份被保留，避免影响其他程序。"
+  if ((purge)); then ok "卸载完成，证书和网络优化已一并清理；备份保留在 $BACKUP_DIR。"
+  else ok "卸载完成。系统证书账户、网络优化和备份被保留，避免影响其他程序。"; fi
 }
 
+# Deployment plus the installation record. The enclosing certificate transaction
+# restores certificates, the renewal hook, the timer and the firewall record if
+# any step fails, so installation is never reported as complete while half done.
+_install_publish() {
+  local domain=$1 public_ip=$2 mode=$3 cert_mode=$4
+  copy_certificate "$domain" || { warn "证书部署失败。"; return 1; }
+  write_env "$MANAGER_STATE" INSTALLED_VERSION "$APP_VERSION" DOMAIN "$domain" PUBLIC_IP "$public_ip" NETWORK_MODE "$mode" CERT_MODE "$cert_mode" ||
+    { warn "写入安装状态失败。"; return 1; }
+}
+# Issuance and deployment must share one transaction. Issuing in its own
+# transaction would commit the temporary HTTP-01 firewall rule, so a later copy,
+# hook, timer or install-record failure would leave TCP 80 open for good.
+_install_certificate() {
+  local domain=$1 public_ip=$2 mode=$3 cert_mode=$4 email=$5 token=${6:-} rc
+  # Capture the status before any negation: `if ! cmd; then rc=$?` would record
+  # the status of `!`, which is always 0 and hides every failure.
+  if [[ $cert_mode == http ]]; then
+    certificate_http "$domain" "$email"; rc=$?
+    if ((rc != 0)); then warn "HTTP-01 证书签发失败。"; return "$rc"; fi
+  else
+    certificate_cloudflare "$domain" "$email" "$token"; rc=$?
+    if ((rc != 0)); then warn "DNS-01 证书签发失败。"; return "$rc"; fi
+  fi
+  _install_publish "$domain" "$public_ip" "$mode" "$cert_mode"
+}
 initial_install() {
   [[ ! -e $MANAGER_STATE ]] || die "已经安装，请使用管理菜单。"
   os_check; require_systemd
   log "安装依赖……"; install_packages; ensure_layout; install_hysteria
-  local mode="" domain="" public_ip="" cert_mode="" email="" token="" resumed=0
+  local mode="" domain="" public_ip="" cert_mode="" email="" token="" resumed=0 rc=0
   if [[ -r $INSTALL_SESSION ]] && confirm "检测到未完成的安装进度，是否从域名/证书步骤继续？"; then
     # shellcheck disable=SC1090
     source "$INSTALL_SESSION"
@@ -904,26 +1909,44 @@ initial_install() {
   make_backup; configure_network
   if certificate_valid "$domain"; then
     ok "检测到 30 天以上有效期的现有证书，将安全复用。"
-  elif [[ $cert_mode == http ]]; then
+    certificate_transaction _install_publish "$domain" "$public_ip" "$mode" "$cert_mode" ||
+      die "证书部署失败，安装未完成；修正后重新运行安装即可继续。"
+  else
     while true; do
-      if [[ $mode != normal ]] && ! confirm "NAT 模式必须确认公网 TCP 80 → 内部 TCP 80，是否继续？"; then return 0; fi
-      certificate_http "$domain" "$email" && break
-      confirm "HTTP-01 失败，是否在当前步骤重试？选择否将保留进度并返回主菜单。" || return 0
-    done
-  elif [[ $cert_mode == cloudflare ]]; then
-    while true; do
-      token=$(ask_secret "Cloudflare" "请输入仅含 Zone.DNS Edit 权限的 API Token") || return $?
-      if [[ -z $token ]]; then warn "Token 不能为空，请重新输入。"; continue; fi
-      if certificate_cloudflare "$domain" "$email" "$token"; then unset token; break; fi
+      if [[ $cert_mode == http ]]; then
+        if [[ $mode != normal ]] && ! confirm "NAT 模式必须确认公网 TCP 80 → 内部 TCP 80，是否继续？"; then return 0; fi
+      else
+        token=$(ask_secret "Cloudflare" "请输入仅含 Zone.DNS Edit 权限的 API Token") || return $?
+        if [[ -z $token ]]; then warn "Token 不能为空，请重新输入。"; continue; fi
+      fi
+      # Issuance, deployment and the install record commit or roll back together,
+      # so a failed copy, hook or timer never leaves the temporary HTTP-01 rule
+      # committed on the firewall.
+      if certificate_transaction _install_certificate "$domain" "$public_ip" "$mode" "$cert_mode" "$email" "$token"; then
+        unset token; break
+      else
+        rc=$?
+      fi
       unset token
-      confirm "DNS-01 失败，是否重新输入 Token？选择否将保留进度并返回主菜单。" || return 0
+      # A signal must return its status instead of asking for a retry, otherwise
+      # an interrupted install looks like a declined retry.
+      ((rc < 128)) || return "$rc"
+      # Declining a retry returns to the menu but must not report a completed
+      # install: the resumable checkpoint stays, and the status stays nonzero.
+      if [[ $cert_mode == http ]]; then
+        confirm "HTTP-01 失败，是否在当前步骤重试？选择否将保留进度并返回主菜单。" || return 1
+      else
+        confirm "DNS-01 失败，是否重新输入 Token？选择否将保留进度并返回主菜单。" || return 1
+      fi
     done
   fi
-  copy_certificate "$domain"
-  write_env "$MANAGER_STATE" INSTALLED_VERSION "$APP_VERSION" DOMAIN "$domain" PUBLIC_IP "$public_ip" NETWORK_MODE "$mode" CERT_MODE "$cert_mode"
   rm -f "$INSTALL_SESSION"
-  log "创建 HY2 直连节点……"; create_direct
-  if confirm "现在添加 ISP SOCKS5 全局节点？"; then create_isp; fi
+  log "创建 HY2 直连节点……"
+  # A cancelled or failed node creation must not end with a success banner, and
+  # its status (including 128+ from a signal) has to reach the caller.
+  create_direct; rc=$?
+  ((rc == 0)) || return "$rc"
+  if confirm "现在添加 ISP SOCKS5 全局节点？"; then create_isp; rc=$?; ((rc == 0)) || return "$rc"; fi
   ok "安装完成。运行 hy2 查看菜单（旧命令 hy2-manager 仍可使用）。"
 }
 
@@ -1012,19 +2035,37 @@ node_menu() {
     while [[ -r $NODE_DIR/$id.env ]]; do
       load_node "$id"
       prompt=$(node_brief "$NODE_DIR/$id.env")
-      options=(1 "查看详情、链接 / 二维码" 2 "修改端口")
-      [[ $TYPE != isp ]] || options+=(3 "更换 ISP（保留 HY2 链接）")
-      options+=(4 "删除此节点" 0 "返回节点列表")
+      options=(1 "查看详情、链接 / 二维码" 2 "修改端口" 3 "启动 / 停止 / 重启" 4 "查看日志" 5 "运行时长与流量" 6 "重命名")
+      [[ $TYPE != isp ]] || options+=(7 "更换 ISP（保留 HY2 链接）")
+      options+=(8 "删除此节点" 9 "导出 Clash/Mihomo YAML" 0 "返回节点列表")
       c=$(choose "管理 $NAME" "$prompt" "${options[@]}") || break
       case $c in
         0) break ;;
         1) menu_action show_managed_node "$NODE_DIR/$id.env" ;;
         2) menu_action change_node_port "$id" ;;
-        3) if [[ $TYPE == isp ]]; then menu_action replace_isp "$id"; else warn "直连节点没有 ISP 凭据。"; fi ;;
-        4) menu_action remove_node "$id" ;;
+        3) node_power_menu "$id" ;;
+        4) menu_action node_log "$id" ;;
+        5) menu_action node_traffic "$id" ;;
+        6) menu_action rename_node "$id" ;;
+        7) if [[ $TYPE == isp ]]; then menu_action replace_isp "$id"; else warn "直连节点没有 ISP 凭据。"; fi ;;
+        8) menu_action remove_node "$id" ;;
+        9) menu_action show_clash_export "$id" ;;
         *) warn "请选择列出的选项。" ;;
       esac
     done
+  done
+}
+node_power_menu() {
+  local id=$1 c
+  while [[ -r $NODE_DIR/$id.env ]]; do
+    c=$(choose "启动 / 停止 / 重启" "$(node_brief "$NODE_DIR/$id.env")" 1 "启动" 2 "停止" 3 "重启" 0 "返回") || return 0
+    case $c in
+      0) return 0 ;;
+      1) menu_action start_node "$id" ;;
+      2) menu_action stop_node "$id" ;;
+      3) menu_action restart_node "$id" ;;
+      *) warn "请选择列出的选项。" ;;
+    esac
   done
 }
 add_node_menu() {
@@ -1037,24 +2078,24 @@ certificate_details() {
   certificate_summary
   systemctl list-timers --all --no-pager certbot.timer hy2-cert-guard.timer || true
   printf '\n定时器 active 不代表续期成功，请结合续期日志判断。\n'
-  printf '当前开发版暂不提供全局换域名，避免未经验证的迁移中断现有节点。\n'
 }
 certificate_menu() {
   local c
   while true; do
-    c=$(choose "域名与证书" "共用一套证书；查看状态不会执行续期" 1 "查看证书 / 续期计划" 2 "查看最近续期日志" 0 "返回") || return 0
+    c=$(choose "域名与证书" "共用一套证书；查看状态不会执行续期" 1 "查看证书 / 续期计划" 2 "查看最近续期日志" 3 "更换域名（重建全部链接）" 0 "返回") || return 0
     case $c in
       0) return 0 ;;
       1) menu_action certificate_details ;;
       2) menu_action journalctl -u certbot.service -u hy2-cert-guard.service -n 60 --no-pager ;;
+      3) menu_action change_domain ;;
       *) warn "无效选择。" ;;
     esac
   done
 }
 maintenance_menu() {
   local c
-  c=$(choose "诊断与备份" "诊断只读，不自动修改系统" 1 "检查节点、证书与网络" 2 "备份配置" 0 "返回") || return 0
-  case $c in 1) menu_action diagnose ;; 2) menu_action make_backup ;; 0) return 0 ;; *) warn "无效选择。" ;; esac
+  c=$(choose "诊断与备份" "诊断只读，不自动修改系统" 1 "检查节点、证书与网络" 2 "备份配置" 3 "列出备份" 4 "还原备份" 0 "返回") || return 0
+  case $c in 1) menu_action diagnose ;; 2) menu_action make_backup ;; 3) menu_action list_backups ;; 4) menu_action restore_backup ;; 0) return 0 ;; *) warn "无效选择。" ;; esac
 }
 advanced_menu() {
   local c
@@ -1092,6 +2133,76 @@ restart_node() {
   ok "$NAME 已重启。"
 }
 
+# 供事务回滚等场景调用的静默重启：不交互、不打印成功信息，也不改变开机自启状态。
+restart_node_now() {
+  local id=$1 f="$NODE_DIR/$1.env" service port
+  [[ -r $f ]] || return 1
+  service=$(env_get "$f" SERVICE)
+  port=$(env_get "$f" LISTEN_PORT)
+  [[ -n $service && -n $port ]] || return 1
+  restart_unit_checked "$service" "$port"
+}
+
+node_log() {
+  load_manager; local id=${1:-} lines=${2:-60}
+  [[ -n $id ]] || id=$(select_node) || return $?
+  load_node "$id"
+  printf '\n%s 最近 %s 行日志（%s）：\n\n' "$NAME" "$lines" "$SERVICE"
+  journalctl -u "$SERVICE" -n "$lines" --no-pager || true
+  printf '\n只看错误：journalctl -u %s -p err -n 50 --no-pager\n' "$SERVICE"
+}
+
+# 流量取 systemd 的累计计数，单位字节；读不到时退回运行时长。
+node_traffic() {
+  load_manager; local id=${1:-} service active since rx tx
+  [[ -n $id ]] || id=$(select_node) || return $?
+  load_node "$id"
+  service=$SERVICE
+  active=$(systemctl is-active "$service" 2>/dev/null || true)
+  since=$(systemctl show "$service" -p ActiveEnterTimestamp --value 2>/dev/null || true)
+  rx=$(systemctl show "$service" -p IPIngressBytes --value 2>/dev/null || true)
+  tx=$(systemctl show "$service" -p IPEgressBytes --value 2>/dev/null || true)
+  printf '\n%s（%s）\n  状态：%s\n' "$NAME" "$service" "$(service_label "$service")"
+  [[ -z $since ]] || printf '  本次启动：%s\n' "$since"
+  if [[ $rx =~ ^[0-9]+$ && $tx =~ ^[0-9]+$ && $rx != 18446744073709551615 && $tx != 18446744073709551615 ]]; then
+    printf '  累计入站：%s\n  累计出站：%s\n' "$(human_bytes "${rx:-0}")" "$(human_bytes "${tx:-0}")"
+  else
+    printf '  流量：当前 systemd 未提供计数（需要 v244+ 且开启 IP accounting）。\n'
+  fi
+  printf '  说明：systemd 计数自本次启动累计，重启服务会清零；这不是运营商账单。\n'
+}
+
+human_bytes() {
+  local v=${1:-0}
+  [[ $v =~ ^[0-9]+$ ]] || { printf '%s' "$v"; return; }
+  awk -v b="$v" 'BEGIN{s="B KB MB GB TB PB"; n=split(s,u," "); i=1; while(b>=1024 && i<n){b/=1024; i++} printf (i==1?"%d %s\n":"%.1f %s\n"), b, u[i]}'
+}
+
+rename_node() {
+  load_manager; local id=${1:-} f new
+  [[ -n $id ]] || id=$(select_node) || return $?
+  load_node "$id"; f="$NODE_DIR/$id.env"
+  new=$(ask_valid_name "重命名 $NAME" "新名称（只影响显示，不改变链接）" "$NAME") || return $?
+  [[ $new != "$NAME" ]] || { ok "名称未改变。"; return 0; }
+  local tmp; tmp=$(mktemp); cleanup_files+=("$tmp")
+  sed "s|^NAME=.*|NAME=$(printf '%q' "$new")|" "$f" >"$tmp"
+  install -o root -g root -m 600 "$tmp" "$f"
+  # URI 里的 #fragment 是客户端显示名，跟着改，密码和域名不动。
+  if [[ -r ${URI_FILE:-} ]]; then
+    local utmp; utmp=$(mktemp); cleanup_files+=("$utmp")
+    python3 - "$URI_FILE" "$new" >"$utmp" <<'PY'
+from pathlib import Path
+import sys
+from urllib.parse import urlsplit, urlunsplit, quote
+path, name = Path(sys.argv[1]), sys.argv[2]
+uri = urlsplit(path.read_text(encoding='utf-8').strip())
+print(urlunsplit(uri._replace(fragment=name)), end='')
+PY
+    install -o root -g root -m 600 "$utmp" "$URI_FILE"
+  fi
+  ok "已重命名为 $new；HY2 链接的密码、端口和域名保持不变。"
+}
+
 # ---------------- 交互层：单屏面板 ----------------
 # 约束：
 #   * 只用 bash 内建 + ANSI；中文对齐借用 python3（本脚本本来已依赖 python3）。
@@ -1099,17 +2210,46 @@ restart_node() {
 UI_MIN_COLS=70
 UI_MIN_ROWS=14
 UI_CERT_TEXT=""
+UI_REFRESH_AT=-1
+declare -A UI_NODE_CACHE=()
+
+# Both frames reserve eight lines for borders/header/help, plus the last terminal
+# row to avoid scrolling. Re-read geometry on every frame and before actions.
+ui_dimensions() {
+  UI_COLS=$(tput cols 2>/dev/null || printf 80)
+  UI_ROWS=$(tput lines 2>/dev/null || printf 24)
+  [[ $UI_COLS =~ ^[0-9]{1,6}$ ]] || UI_COLS=1
+  [[ $UI_ROWS =~ ^[0-9]{1,6}$ ]] || UI_ROWS=1
+  UI_COLS=$((10#$UI_COLS)); UI_ROWS=$((10#$UI_ROWS))
+  (( UI_COLS > 0 )) || UI_COLS=1
+  (( UI_ROWS > 0 )) || UI_ROWS=1
+  UI_WIDTH=$((UI_COLS - 6))
+  (( UI_WIDTH <= 72 )) || UI_WIDTH=72
+  (( UI_WIDTH >= 0 )) || UI_WIDTH=0
+  UI_PAGE_SIZE=$((UI_ROWS - 9))
+  (( UI_PAGE_SIZE > 0 )) || UI_PAGE_SIZE=1
+}
 
 ui_requested() {
   [[ ${HY2M_UI:-tui} == tui ]] || return 1
   is_tty || return 1
   command -v python3 >/dev/null 2>&1 || return 1
   [[ ${TERM:-dumb} != dumb ]] || return 1
-  local cols rows
-  cols=$(tput cols 2>/dev/null || printf 80)
-  rows=$(tput lines 2>/dev/null || printf 24)
-  [[ $cols =~ ^[0-9]+$ && $rows =~ ^[0-9]+$ ]] || return 1
-  (( cols >= UI_MIN_COLS && rows >= UI_MIN_ROWS ))
+  ui_dimensions
+  (( UI_COLS >= UI_MIN_COLS && UI_ROWS >= UI_MIN_ROWS ))
+}
+
+ui_viewport() {
+  local sel=$1 count=$2
+  UI_FIRST=$((sel / UI_PAGE_SIZE * UI_PAGE_SIZE))
+  UI_LAST=$((UI_FIRST + UI_PAGE_SIZE))
+  (( UI_LAST <= count )) || UI_LAST=$count
+}
+
+ui_draw_small() {
+  local hint="q/Esc: exit; resize to ${UI_MIN_COLS}x${UI_MIN_ROWS}"
+  ui_home
+  if (( UI_ROWS > 1 )); then printf '%s\n' "${hint:0:UI_COLS-1}" >&2; fi
 }
 
 ui_init_colors() {
@@ -1160,7 +2300,7 @@ for parts in rows:
         while len(colw) <= i:
             colw.append(0)
         colw[i] = max(colw[i], dw(c))
-t = "─ " + title + " "
+t, _ = cut("─ " + title + " ", width + 2)
 fill = max(0, width + 2 - dw(t))
 out = ["┌" + t + "─" * fill + "┐"]
 for parts in rows:
@@ -1180,21 +2320,37 @@ sys.stdout.write("\n".join(out) + "\n")
 ' "$1" "$2"
 }
 
-ui_enter_screen() { [[ -t 1 ]] || return 0; tput smcup 2>/dev/null || true; tput civis 2>/dev/null || true; ui_home; }
-ui_leave_screen() { [[ -t 1 ]] || return 0; tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true; }
+ui_enter_screen() { is_tty || return 0; tput smcup >&2 2>/dev/null || true; tput civis >&2 2>/dev/null || true; ui_home; }
+ui_leave_screen() { is_tty || return 0; tput cnorm >&2 2>/dev/null || true; tput rmcup >&2 2>/dev/null || true; }
 ui_home() { printf '\033[H\033[2J' >&2; }
 
-# 读单键；方向键归一成 up/down/left/right，Esc 归一成 esc，回车归一成 enter。
+# 读单键；方向键、PgUp/PgDn、Esc、回车归一化。空闲时检查尺寸，
+# 仅在窗口变化时要求重画，不把 read 超时误当成 EOF 或回车。
 ui_readkey() {
-  local k k2 k3
-  IFS= read -rsn1 k || { printf 'quit'; return 0; }
+  local k k2 k3 k4 rc cols=${UI_COLS:-} rows=${UI_ROWS:-}
+  while true; do
+    if IFS= read -rsn1 -t 0.25 k; then break; else rc=$?; fi
+    if (( rc <= 128 )); then printf 'quit'; return 0; fi
+    ui_dimensions
+    if [[ $cols != "$UI_COLS" || $rows != "$UI_ROWS" ]]; then printf 'resize'; return 0; fi
+  done
   if [[ $k == $'\033' ]]; then
     k2=""
     IFS= read -rsn1 -t 0.05 k2 || true
     if [[ $k2 == '[' ]]; then
       k3=""
       IFS= read -rsn1 -t 0.05 k3 || true
-      case $k3 in A) printf 'up' ;; B) printf 'down' ;; C) printf 'right' ;; D) printf 'left' ;; *) printf 'esc' ;; esac
+      case $k3 in
+        A) printf 'up' ;; B) printf 'down' ;; C) printf 'right' ;; D) printf 'left' ;;
+        5|6)
+          k4=""
+          IFS= read -rsn1 -t 0.05 k4 || true
+          if [[ $k4 != '~' ]]; then printf 'esc'
+          elif [[ $k3 == 5 ]]; then printf 'pageup'
+          else printf 'pagedown'; fi
+          ;;
+        *) printf 'esc' ;;
+      esac
       return 0
     fi
     printf 'esc'
@@ -1216,6 +2372,7 @@ ui_node_ids() {
 
 # 输出 name<TAB>类型<TAB>状态<TAB>内部端口<TAB>公网端口；在子 shell 中读取，避免污染调用方状态。
 ui_node_cells() {
+  if [[ -n ${UI_NODE_CACHE[$1]+x} ]]; then printf '%s\n' "${UI_NODE_CACHE[$1]}"; return 0; fi
   local f="$NODE_DIR/$1.env"
   [[ -r $f ]] || return 1
   (
@@ -1227,14 +2384,26 @@ ui_node_cells() {
   )
 }
 
+ui_refresh_status() {
+  local now=$SECONDS id cells
+  if ((UI_REFRESH_AT >= 0 && now - UI_REFRESH_AT < 2)); then return 0; fi
+  UI_NODE_CACHE=()
+  ui_cert_text
+  while IFS= read -r id; do
+    cells=$(ui_node_cells "$id") || continue
+    UI_NODE_CACHE[$id]=$cells
+  done < <(ui_node_ids)
+  UI_REFRESH_AT=$now
+}
+
 ui_cert_text() {
   local f="$TLS_DIR/fullchain.pem" end epoch now days
   if [[ -r $f ]]; then
     end=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null) || end=""
-    epoch=$(openssl x509 -in "$f" -noout -checkend 0 >/dev/null 2>&1 && date -d "${end#notAfter=}" +%s 2>/dev/null) || epoch=""
+    epoch=$(date -d "${end#notAfter=}" +%s 2>/dev/null) || epoch=""
     if [[ $epoch =~ ^[0-9]+$ ]]; then
       now=$(date +%s); days=$(( (epoch - now) / 86400 ))
-      if (( days < 0 )); then UI_CERT_TEXT="${C_RED}证书已过期${C_RESET}"
+      if (( epoch <= now )); then UI_CERT_TEXT="${C_RED}证书已过期${C_RESET}"
       elif (( days < 14 )); then UI_CERT_TEXT="${C_YELLOW}证书 ${days} 天${C_RESET}"
       else UI_CERT_TEXT="${C_GREEN}证书 ${days} 天${C_RESET}"; fi
       return 0
@@ -1252,56 +2421,55 @@ ui_status_color() {
   esac
 }
 
-ui_width() {
-  local cols
-  cols=$(tput cols 2>/dev/null || printf 80)
-  [[ $cols =~ ^[0-9]+$ ]] || cols=80
-  local w=$(( cols - 6 ))
-  (( w > 72 )) && w=72
-  (( w < 40 )) && w=40
-  printf '%s' "$w"
-}
+ui_width() { ui_dimensions; printf '%s' "$UI_WIDTH"; }
 
 ui_draw_panel() {
   local sel=$1; shift
   local -a ids=("$@") body=()
-  local i id mark name type state listen public w
+  local i id mark name type state listen public first=0
   ui_init_colors
-  w=$(ui_width)
+  ui_dimensions
+  if (( UI_COLS < UI_MIN_COLS || UI_ROWS < UI_MIN_ROWS )); then ui_draw_small; return 0; fi
+  ui_viewport "$sel" "${#ids[@]}"
   body+=("T	${C_BOLD}HY2 ISP Manager $APP_VERSION${C_RESET}")
   body+=("T	域名 ${DOMAIN:-未设置}   网络 ${NETWORK_MODE:-未设置}   $UI_CERT_TEXT")
-  body+=("T	")
   body+=("R	#	节点	状态	内部/公网	类型")
-  for ((i = 0; i < ${#ids[@]}; i++)); do
+  for ((i = UI_FIRST; i < UI_LAST; i++)); do
     id=${ids[i]}
     IFS=$'\t' read -r name type state listen public < <(ui_node_cells "$id") || continue
     mark=' '; (( i == sel )) && mark='>'
     body+=("R	${mark}$((i + 1))	${name}	$(ui_status_color "$state")	${listen}/${public}	${type}")
   done
-  ((${#ids[@]})) || body+=("T	${C_DIM}尚未创建节点，按 a 添加。${C_RESET}")
-  body+=("T	")
-  body+=("T	${C_DIM}↑↓ 选择   Enter 进入   a 添加   c 证书   d 诊断   s 设置   q 退出${C_RESET}")
+  if ((${#ids[@]})); then first=$((UI_FIRST + 1))
+  else body+=("T	${C_DIM}尚未创建节点，按 a 添加。${C_RESET}"); fi
+  body+=("T	${C_DIM}${first}-${UI_LAST} / ${#ids[@]} 节点${C_RESET}")
+  body+=("T	${C_DIM}↑↓ 选择  PgUp/PgDn 翻页  Enter 进入${C_RESET}")
+  body+=("T	${C_DIM}a 添加  c 证书  d 诊断  s 设置  q 退出${C_RESET}")
   ui_home
-  printf '%s\n' "${body[@]}" | ui_box "$w" "HY2 管理面板" >&2
+  printf '%s\n' "${body[@]}" | ui_box "$UI_WIDTH" "HY2 管理面板" >&2
 }
 
 ui_draw_menu() {
   local title=$1 prompt=$2 sel=$3; shift 3
   local -a labels=("$@") body=()
-  local i mark w
+  local i mark first=0
   ui_init_colors
-  w=$(ui_width)
+  ui_dimensions
+  if (( UI_COLS < UI_MIN_COLS || UI_ROWS < UI_MIN_ROWS )); then ui_draw_small; return 0; fi
+  ui_viewport "$sel" "${#labels[@]}"
   body+=("T	${C_BOLD}${title}${C_RESET}")
   body+=("T	${C_DIM}${prompt}${C_RESET}")
   body+=("T	")
-  for ((i = 0; i < ${#labels[@]}; i++)); do
+  for ((i = UI_FIRST; i < UI_LAST; i++)); do
     mark='  '; (( i == sel )) && mark="${C_GREEN}>${C_RESET} "
     body+=("T	${mark}${labels[i]}")
   done
-  body+=("T	")
-  body+=("T	${C_DIM}↑↓ 移动   Enter 确定   Esc 返回${C_RESET}")
+  ((${#labels[@]} == 0)) || first=$((UI_FIRST + 1))
+  body+=("T	${C_DIM}${first}-${UI_LAST} / ${#labels[@]} 项${C_RESET}")
+  body+=("T	${C_DIM}↑↓ 移动  PgUp/PgDn 翻页${C_RESET}")
+  body+=("T	${C_DIM}Enter 确定  Esc/q 返回${C_RESET}")
   ui_home
-  printf '%s\n' "${body[@]}" | ui_box "$w" "$APP_NAME" >&2
+  printf '%s\n' "${body[@]}" | ui_box "$UI_WIDTH" "$APP_NAME" >&2
 }
 
 # ui_menu <标题> <说明> "键|说明" …；选中返回键，Esc/q 返回 20。
@@ -1317,11 +2485,16 @@ ui_menu() {
   while true; do
     ui_draw_menu "$title" "$prompt" "$sel" "${labels[@]}"
     key=$(ui_readkey)
+    case $key in esc|quit|q|Q) return 20 ;; esac
+    ui_dimensions
+    if (( UI_COLS < UI_MIN_COLS || UI_ROWS < UI_MIN_ROWS )); then continue; fi
     case $key in
       up|k) if (( sel > 0 )); then sel=$((sel - 1)); fi ;;
       down|j) if (( sel < ${#keys[@]} - 1 )); then sel=$((sel + 1)); fi ;;
+      pageup) sel=$((sel - UI_PAGE_SIZE)); (( sel >= 0 )) || sel=0 ;;
+      pagedown) sel=$((sel + UI_PAGE_SIZE)); (( sel < ${#keys[@]} )) || sel=$(( ${#keys[@]} - 1 )) ;;
       enter) printf '%s' "${keys[sel]}"; return 0 ;;
-      esc|quit|q|Q) return 20 ;;
+      resize) continue ;;
       *)
         for ((i = 0; i < ${#keys[@]}; i++)); do
           if [[ $key == "${keys[i]}" ]]; then printf '%s' "${keys[i]}"; return 0; fi
@@ -1335,7 +2508,10 @@ ui_menu() {
 ui_run() {
   ui_leave_screen
   run_menu_action "$@"
+  UI_REFRESH_AT=-1; UI_NODE_CACHE=()
   if is_tty; then printf '\n按任意键返回面板……' >&2; IFS= read -rsn1 _ || true; fi
+  # Actions run in a subshell; domain changes/restores update disk, not our vars.
+  if [[ -r $MANAGER_STATE ]]; then load_manager; ui_cert_text; fi
   ui_enter_screen
 }
 
@@ -1344,9 +2520,9 @@ ui_node_actions() {
   local -a items
   while [[ -r $NODE_DIR/$id.env ]]; do
     IFS=$'\t' read -r name type _ < <(ui_node_cells "$id") || { name=$id; type=unknown; }
-    items=("1|查看详情、链接 / 二维码" "2|启动节点" "3|停止节点" "4|重启节点" "5|修改端口")
-    [[ $type != isp ]] || items+=("6|更换 ISP（保留 HY2 链接）")
-    items+=("0|返回节点列表")
+    items=("1|查看详情、链接 / 二维码" "2|启动节点" "3|停止节点" "4|重启节点" "5|修改端口" "6|查看日志" "7|运行时长与流量" "8|重命名")
+    [[ $type != isp ]] || items+=("9|更换 ISP（保留 HY2 链接）")
+    items+=("e|导出 Clash/Mihomo YAML" "x|删除此节点" "0|返回节点列表")
     choice=$(ui_menu "管理 $name" "选择要执行的操作" "${items[@]}") || return 0
     case $choice in
       0) return 0 ;;
@@ -1355,7 +2531,12 @@ ui_node_actions() {
       3) ui_run stop_node "$id" ;;
       4) ui_run restart_node "$id" ;;
       5) ui_run change_node_port "$id" ;;
-      6) ui_run replace_isp "$id" ;;
+      6) ui_run node_log "$id" ;;
+      7) ui_run node_traffic "$id" ;;
+      8) ui_run rename_node "$id" ;;
+      9) ui_run replace_isp "$id" ;;
+      e) ui_run show_clash_export "$id" ;;
+      x) ui_run remove_node "$id" ;;
     esac
   done
   return 0
@@ -1376,11 +2557,12 @@ ui_cert_menu() {
   local c
   while true; do
     c=$(ui_menu "域名与证书" "共用一套证书；查看状态不会执行续期" \
-      "1|查看证书 / 续期计划" "2|查看最近续期日志" "0|返回") || return 0
+      "1|查看证书 / 续期计划" "2|查看最近续期日志" "3|更换域名（重建全部链接）" "0|返回") || return 0
     case $c in
       0) return 0 ;;
       1) ui_run certificate_details ;;
       2) ui_run journalctl -u certbot.service -u hy2-cert-guard.service -n 60 --no-pager ;;
+      3) ui_run change_domain ;;
     esac
   done
 }
@@ -1388,10 +2570,12 @@ ui_cert_menu() {
 ui_diag_menu() {
   local c
   c=$(ui_menu "诊断与备份" "诊断只读，不自动修改系统" \
-    "1|检查节点、证书与网络" "2|备份配置" "0|返回") || return 0
+    "1|检查节点、证书与网络" "2|备份配置" "3|列出备份" "4|还原备份" "0|返回") || return 0
   case $c in
     1) ui_run diagnose ;;
     2) ui_run make_backup ;;
+    3) ui_run list_backups ;;
+    4) ui_run restore_backup ;;
     0) return 0 ;;
   esac
 }
@@ -1407,52 +2591,56 @@ ui_advanced_menu() {
   esac
 }
 
-ui_main_loop() {
+# Screen traps belong to this subshell; caller cleanup/signal traps stay intact.
+ui_main_loop() (
   local -a ids=()
-  local sel=0 key id i
+  local sel=0 key id i choice
   ui_init_colors
-  load_manager
-  ui_cert_text
-  ui_enter_screen
   trap 'ui_leave_screen' EXIT
-  trap 'ui_leave_screen; exit 130' INT
-  trap 'ui_leave_screen; exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  ui_enter_screen
   while true; do
+    if [[ ! -r $MANAGER_STATE ]]; then
+      choice=$(ui_menu "$APP_NAME $APP_VERSION" "尚未安装：系统检查 → 域名 → 证书 → 直连 → ISP" \
+        "1|开始全新安装" "0|退出") || break
+      case $choice in 1) ui_run initial_install ;; 0) break ;; esac
+      continue
+    fi
+    load_manager
+    ui_refresh_status
     ids=()
     while IFS= read -r id; do ids+=("$id"); done < <(ui_node_ids)
-    if ((${#ids[@]})) && (( sel >= ${#ids[@]} )); then sel=$(( ${#ids[@]} - 1 )); fi
+    if (( sel >= ${#ids[@]} )); then sel=$(( ${#ids[@]} - 1 )); fi
     if (( sel < 0 )); then sel=0; fi
     ui_draw_panel "$sel" ${ids[@]+"${ids[@]}"}
     key=$(ui_readkey)
+    case $key in q|Q|quit|esc) break ;; esac
+    ui_dimensions
+    if (( UI_COLS < UI_MIN_COLS || UI_ROWS < UI_MIN_ROWS )); then continue; fi
     case $key in
-      q|Q|quit) break ;;
       up|k) if (( sel > 0 )); then sel=$((sel - 1)); fi ;;
       down|j) if (( sel < ${#ids[@]} - 1 )); then sel=$((sel + 1)); fi ;;
-      enter)
-        if ((${#ids[@]})); then ui_node_actions "${ids[sel]}"; fi
-        ui_cert_text
-        ;;
+      pageup) sel=$((sel - UI_PAGE_SIZE)); (( sel >= 0 )) || sel=0 ;;
+      pagedown) sel=$((sel + UI_PAGE_SIZE)); (( sel < ${#ids[@]} )) || sel=$(( ${#ids[@]} - 1 )) ;;
+      enter) if ((${#ids[@]})); then ui_node_actions "${ids[sel]}"; fi ;;
       a|A) ui_add_menu ;;
-      c|C) ui_cert_menu; ui_cert_text ;;
+      c|C) ui_cert_menu ;;
       d|D) ui_diag_menu ;;
       s|S) ui_advanced_menu ;;
       [1-9])
         i=$((key - 1))
         if (( i < ${#ids[@]} )); then sel=$i; ui_node_actions "${ids[sel]}"; fi
-        ui_cert_text
         ;;
     esac
     [[ -r $MANAGER_STATE ]] || break
   done
-  ui_leave_screen
-  trap - EXIT INT TERM
-  trap cleanup EXIT
   return 0
-}
+)
 
 main_menu() {
   local c prompt
-  if [[ -r $MANAGER_STATE ]] && ui_requested; then
+  if ui_requested && { [[ -r $MANAGER_STATE ]] || ! legacy_direct_available; }; then
     ui_main_loop
     return 0
   fi
@@ -1483,15 +2671,25 @@ $APP_NAME $APP_VERSION
   hy2
   hy2 status
   hy2 change-port
+  hy2 change-domain
+  hy2 rename-node
+  hy2 node-log
+  hy2 traffic
+  hy2 start-node
+  hy2 stop-node
+  hy2 restart-node
   sudo bash hy2-manager install-self
   sudo hy2-manager install
   sudo hy2-manager create-direct
   sudo hy2-manager add-isp
   sudo hy2-manager replace-isp
   sudo hy2-manager show
+  sudo hy2-manager export-clash [direct|isp1|...]  # stdout 为完整敏感 YAML
   sudo hy2-manager status
   sudo hy2-manager diagnose
   sudo hy2-manager backup
+  sudo hy2-manager backups
+  sudo hy2-manager restore-backup
   sudo hy2-manager remove-node
   sudo hy2-manager uninstall
   sudo hy2-manager menu
@@ -1506,7 +2704,7 @@ main() {
     exec sudo -- bash "$0" "$@"
   fi
   case $cmd in
-    install-self) install_self ;; install) initial_install ;; create-direct) create_direct ;; add-isp) create_isp ;; replace-isp) replace_isp "${2:-}" ;; change-port) change_node_port "${2:-}" ;; show) show_nodes ;; status) status_all ;; diagnose) diagnose ;; backup) make_backup ;; remove-node) remove_node "${2:-}" ;; uninstall) uninstall_all ;; menu) main_menu ;; *) usage; exit 2 ;;
+    renew-certificate) with_mutation_lock --wait renew_certificate ;; install-self) with_mutation_lock install_self ;; install) with_mutation_lock initial_install ;; create-direct) with_mutation_lock create_direct ;; add-isp) with_mutation_lock create_isp ;; replace-isp) with_mutation_lock replace_isp "${2:-}" ;; change-port) with_mutation_lock change_node_port "${2:-}" ;; change-domain) with_mutation_lock change_domain ;; rename-node) with_mutation_lock rename_node "${2:-}" ;; node-log) node_log "${2:-}" "${3:-60}" ;; traffic) node_traffic "${2:-}" ;; start-node) with_mutation_lock start_node "${2:-}" ;; stop-node) with_mutation_lock stop_node "${2:-}" ;; restart-node) with_mutation_lock restart_node "${2:-}" ;; show) show_nodes ;; export-clash) export_clash "${2:-}" ;; status) status_all ;; diagnose) diagnose ;; backup) with_mutation_lock make_backup ;; backups) list_backups ;; restore-backup) with_mutation_lock restore_backup "${2:-}" ;; remove-node) with_mutation_lock remove_node "${2:-}" ;; uninstall) with_mutation_lock uninstall_all ;; menu) main_menu ;; *) usage; exit 2 ;;
   esac
 }
 

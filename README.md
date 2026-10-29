@@ -10,7 +10,7 @@
 - HY2 直连节点；
 - 以有认证 ISP SOCKS5 为**全局、失败关闭**出口的 HY2 节点；
 - Let’s Encrypt HTTP-01 与 Cloudflare DNS-01；
-- v2rayN URI、终端二维码、状态、诊断、备份和安全卸载。
+- 通用 HY2 URI／终端二维码、Clash.Meta/Mihomo YAML 导出、状态、诊断、备份和安全卸载。
 
 > 当前稳定版本：`v0.2.1`。已在 LXD NAT VPS 与 KVM 公网 VPS 验证输入重试、菜单错误隔离、证书、服务、节点独立状态、旧Direct兼容显示、SOCKS5 TCP认证、ISP出口、清理恢复及重启持久化。
 
@@ -62,21 +62,22 @@ sudo hy2-manager
 已安装后，在真正的终端里直接运行 `hy2` 会进入单屏面板：一屏看完全部节点，方向键选择，单键操作，不再层层弹窗。
 
 ```text
-┌─ HY2 管理面板 ──────────────────────────────────────────┐
-│ HY2 ISP Manager 0.3.0-dev                               │
-│ 域名 root.example.com   网络 normal   证书 89 天        │
-│                                                         │
-│ #   节点    状态      内部/公网  类型                   │
-│  1  Direct  ● 运行中  443/443    direct                 │
-│ >2  ISP-1   ● 运行中  8443/8443  isp1                   │
-│  3  ISP-2   ● 故障    9443/9443  isp2                   │
-│                                                         │
-│ ↑↓ 选择   Enter 进入   a 添加   c 证书   d 诊断        │
-│ s 设置   q 退出                                         │
-└─────────────────────────────────────────────────────────┘
+┌─ HY2 管理面板 ───────────────────────────────────────────────────────┐
+│ HY2 ISP Manager 0.3.0-dev                                            │
+│ 域名 root.example.com   网络 normal   证书 89 天                     │
+│ #   节点    状态      内部/公网  类型                                │
+│  1  Direct  ● 运行中  443/443    direct                              │
+│ >2  ISP-1   ● 运行中  8443/8443  isp                                 │
+│  3  ISP-2   ● 故障    9443/9443  isp                                 │
+│ 1-3 / 3 节点                                                         │
+│ ↑↓ 选择  PgUp/PgDn 翻页  Enter 进入                                  │
+│ a 添加  c 证书  d 诊断  s 设置  q 退出                               │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-节点里 `Enter` 可以查看详情与链接、启动、停止、重启、修改端口，ISP 节点还能更换出口。没有 TTY、`TERM=dumb`、窗口小于 70×14、或设置 `HY2M_UI=plain` 时，自动退回原来的数字菜单，行为与旧版一致：
+节点多到一屏放不下时，列表跟着选中项翻页，末行显示当前可见范围（如 `16-30 / 30 节点`），`PgUp`/`PgDn` 整页跳转；长操作菜单同样分页。
+
+节点里 `Enter` 可以查看详情与链接、启动、停止、重启、修改端口、查看日志、查看运行时长与流量、重命名，ISP 节点还能更换出口。没有 TTY、`TERM=dumb`、窗口小于 70×14、或设置 `HY2M_UI=plain` 时，自动退回原来的数字菜单，行为与旧版一致（面板运行中把窗口缩到 70×14 以下会停在“请放大窗口”提示，按 `q`/`Esc` 退出）：
 
 ```text
 1. 全新安装
@@ -100,12 +101,24 @@ sudo hy2-manager create-direct
 sudo hy2-manager add-isp
 sudo hy2-manager replace-isp
 sudo hy2-manager show
+sudo hy2-manager export-clash direct
 sudo hy2-manager status
 sudo hy2-manager diagnose
 sudo hy2-manager backup
+sudo hy2-manager backups
+sudo hy2-manager restore-backup hy2m-20260101-120000.tar.gz
+sudo hy2-manager change-domain
+sudo hy2-manager rename-node
+sudo hy2-manager node-log
+sudo hy2-manager traffic
+sudo hy2-manager start-node
+sudo hy2-manager stop-node
+sudo hy2-manager restart-node
 sudo hy2-manager remove-node
 sudo hy2-manager uninstall
 ```
+
+换域名是事务性的：会先备份 `manager.env`、全部节点记录、证书和导出链接，再签发新证书、重写所有链接的 host 与 `sni`、重启全部节点；中途任一步失败会自动回滚到旧域名、旧证书和旧链接。客户端需要重新导入链接，SSH 不受影响。
 
 节点依赖和显示规则：
 
@@ -114,6 +127,22 @@ sudo hy2-manager uninstall
 - 仍有ISP记录时禁止删除其依赖的Direct。
 - `show`、`status` 和诊断不再把 `manager.env` 当作节点清单；即使旧版Direct没有管理器状态文件，也会通过 `/etc/hysteria/config.yaml` 和 `hysteria-server.service` 兼容显示。
 - 兼容显示为只读，不会重建、重启或覆盖旧Direct服务。
+
+## 客户端导入与 YAML 导出
+
+二维码编码的是通用 `hysteria2://` 节点链接，适用于支持 HY2 的 v2rayN、小火箭等客户端，不是三个客户端各自的二维码，也不是订阅地址；原版 Clash 不支持 HY2，需使用 Clash.Meta/Mihomo 内核的客户端。
+
+在节点菜单选择「导出 Clash/Mihomo YAML」（TUI 按 `e`），确认后显示该节点的完整客户端配置；也可用 `hy2-manager export-clash direct`，将 `direct` 换成 `isp1` 等节点 ID，省略 ID 则交互选择。
+
+保存为文件后通过客户端的本地配置导入（下例权限为 `600`，拒绝覆盖已有文件）：
+
+```bash
+(umask 077; set -o noclobber; sudo hy2-manager export-clash direct > direct-clash.yaml)
+```
+
+导出使用当前节点的公网端口、域名、SNI、HY2 密码与名称，保留 TLS 校验；配置只监听本机 `7890`，使用此代理的请求按 `MATCH` 规则走所选节点，没有直连回退，不自动接管系统流量，也不包含 ISP SOCKS5 凭据或国内分流规则。它是本地配置快照，不提供公开订阅或自动更新，改端口、换域名、重命名、还原后须重新导出并导入客户端；管理器不缓存额外 YAML，以免后续误用旧配置。
+
+YAML 与二维码一样包含完整 HY2 密码，请勿公开、提交到 Git 或上传在线转换站；CLI 的标准输出只有 YAML，交互菜单显示前会要求确认。导出仅支持本管理器的无混淆节点，修改过的链接若关闭 TLS 校验或带有不支持的参数会被拒绝，避免静默丢失安全设置；实际客户端连接仍需另行验证。
 
 ## 普通 VPS 与 NAT VPS
 
@@ -175,13 +204,17 @@ sudo hy2-cert-guard dry-run
 hy2-cert-guard logs
 ```
 
-它会安装每日 `systemd` timer、Certbot deploy hook 和 SSH 登录提示，检查证书有效期、证书/私钥匹配、部署证书一致性、Certbot timer、DNS、TCP 80、UFW、HY2 服务和 UDP 端口。续期成功后原子替换证书并重启登记服务；失败时自动恢复部署前证书并生成：
+它会安装每日 `systemd` timer、Certbot deploy hook 和 SSH 登录提示，检查证书有效期、证书/私钥匹配、部署证书一致性、Certbot timer、DNS、TCP 80、UFW、HY2 服务和 UDP 端口。开发版续期部署逐项验证证书域名、有效期、密钥匹配和文件发布结果，只重启原本运行的节点；失败或中断时恢复部署前证书，回滚不完整会保留快照并报告路径，原停止节点保持停止；每日健康检查发现异常时生成：
 
 ```text
 /root/HY2-CERTIFICATE-ALERT.txt
 ```
 
-非敏感状态保存在 `/var/lib/hy2-cert-guard/status`。旧 Hysteria deploy hooks 会先移动到 `/var/lib/hy2-cert-guard/legacy-hooks/<timestamp>/`，不会永久删除。`dry-run` 不使用 `--run-deploy-hooks`，不会把 Let’s Encrypt staging 证书部署到生产节点。
+非敏感状态保存在 `/var/lib/hy2-cert-guard/status`。开发版只在已验证守护器完整接管管理器节点时，才将管理器续期钩子移到 `/var/lib/hy2-cert-guard/legacy-hooks/<timestamp>/`；手工、混合部署及无法确认归属的其他钩子会保留，不再按文件内容关键词批量移走。`dry-run` 不使用 `--run-deploy-hooks`，不会把 Let’s Encrypt staging 证书部署到生产节点。
+
+开发版在纯管理器部署中从受信任的 `manager.env` 读取当前域名、公网地址和证书方式，换域名后不再沿用旧域名配置；DNS-01 不要求开放 TCP 80，手工或混合部署仍以守护器的显式配置为准。
+
+管理器、证书守护器和守护器安装器共用 `/run/lock/hy2-isp-manager.lock`：交互写操作遇到占用会退出并提示重试，无人值守续期和检查最多等待 300 秒，超时明确报错；锁不放在可能被还原或卸载替换的状态目录中，正常退出由系统释放，不应手工删除锁文件。
 
 ## 节点结构
 
@@ -233,6 +266,12 @@ QUIC rmem_max/wmem_max = 16 MiB（完整 VM 且内核允许时）
 
 不安装魔改内核，不修改 SSH，不关闭密码登录，不清空系统防火墙。UFW 已启用时，只记录并在卸载时删除脚本自己新增的规则。
 
+## 备份适用范围
+
+`backup` / `restore-backup` 用于当前主机上的管理器配置回滚：包含节点状态、HY2 配置与部署证书副本、导出链接、服务单元和管理器续期钩子；它不包含 Hysteria 可执行文件、完整 `/etc/letsencrypt` 账户与续期档案、独立守护器配置，以及服务商 NAT/防火墙设置，因此不是整机迁移或灾难恢复包。
+
+换机器恢复需要另外保护上述内容并重新验证 DNS、续期和公网 UDP 可达性；备份内含密码和私钥，保持 root-only 权限；备份与当前防火墙归属记录不一致时，自动还原会拒绝执行。
+
 ## 安全和回滚
 
 - Hysteria 固定为 `v2.12.2`，并使用官方 `hashes.txt` 校验 SHA256。
@@ -250,13 +289,23 @@ QUIC rmem_max/wmem_max = 16 MiB（完整 VM 且内核允许时）
 ```bash
 bash tests/run.sh
 bash tests/ui-test.sh
+bash tests/tui-test.sh
+bash tests/client-export-test.sh
+bash tests/tui-pagination-test.sh
+bash tests/backup-restore-test.sh
+bash tests/domain-transaction-test.sh
+bash tests/certificate-rollback-test.sh
+bash tests/initial-certificate-test.sh
+bash tests/reliability-test.sh
+bash tests/locking-test.sh
+bash tests/renewal-test.sh
 bash tests/cert-guard-test.sh
 bash tests/guard-discovery-test.sh
 python3 tests/tty-test.py
 shellcheck -x hy2-manager hy2-cert-guard install.sh install-cert-guard.sh tests/*.sh
 ```
 
-测试覆盖语法、端口/域名校验、状态安全序列化、文件权限、TLS 安全字段、ISP fail-closed 静态契约、Cloudflare DNS-01、NAT 双端口和 Hysteria SHA256 校验。
+测试覆盖语法、端口/域名校验、状态安全序列化、文件权限、TLS 安全字段、ISP fail-closed 静态契约、Cloudflare DNS-01、NAT 双端口和 Hysteria SHA256 校验，以及首次安装证书/防火墙/定时器事务的 29 例故障注入（含签发失败、复制失败、`certbot.timer` 部分启用、安装记录写入失败和 `INT`/`TERM` 中断）。
 
 以下项目必须使用一次性 VPS 或快照进行真实集成测试：
 

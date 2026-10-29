@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .tmp
-export TMPDIR="${TMPDIR:-$PWD/.tmp}"
+export TMPDIR="$PWD/.tmp" TMP="$PWD/.tmp" TEMP="$PWD/.tmp"
 tmp=$(mktemp -d "$TMPDIR/tui.XXXXXX")
 export HY2M_SOURCE_ONLY=1 HY2M_TESTING=1
 export HY2M_APP_DIR="$tmp/app" HY2M_STATE_DIR="$tmp/state" HY2M_EXPORT_DIR="$tmp/export"
@@ -14,7 +14,8 @@ export HY2M_SERVICE_DIR="$tmp/systemd" HY2M_SBIN_DIR="$tmp/sbin" HY2M_BIN_DIR="$
 export HY2M_LEGACY_CONFIG="$tmp/legacy.yaml" HY2M_LEGACY_MANAGER_CONFIG="$tmp/legacy.conf"
 export HY2M_LEGACY_URI_FILE="$tmp/legacy-uri" HY2M_LEGACY_TLS_CERT="$tmp/legacy-cert"
 source ./hy2-manager
-trap 'cleanup; rm -rf "$tmp"' EXIT
+# Preserve generated fixtures for diagnosis; clean only manager-owned temp files.
+trap cleanup EXIT
 mkdir -p "$NODE_DIR" "$EXPORT_DIR" "$HYSTERIA_DIR" "$SERVICE_DIR" "$SBIN_DIR" "$BIN_DIR"
 
 failures=0
@@ -90,9 +91,20 @@ sys.exit(0 if len(widths) == 1 else 1)
 empty=$(ui_draw_panel 0 2>&1)
 check 'empty inventory explains the next step' bash -c '[[ $1 == *"尚未创建节点"* ]]' _ "$empty"
 
-menu_view=$(ui_draw_menu '管理 isp1' '选择要执行的操作' 0 '查看详情' '启动节点' 2>&1)
-check 'menu renders every entry' bash -c '[[ $1 == *查看详情* && $1 == *启动节点* ]]' _ "$menu_view"
-check 'menu marks the selected entry' bash -c '[[ $1 == *"> 查看详情"* ]]' _ "$menu_view"
+# Assert visible text, not raw escape bytes: the selected marker has a reset
+# sequence between '>' and its label. Exercise both color modes in every run.
+for color_mode in color plain; do
+  no_color=''; [[ $color_mode != plain ]] || no_color=1
+  menu_view=$(TERM=xterm NO_COLOR="$no_color" ui_draw_menu '管理 isp1' '选择要执行的操作' 0 '查看详情' '启动节点' 2>&1)
+  check "menu renders every entry ($color_mode)" bash -c '[[ $1 == *查看详情* && $1 == *启动节点* ]]' _ "$menu_view"
+  check "menu marks only the selected entry ($color_mode)" python3 -c '
+import re, sys
+raw, mode = sys.argv[1:]
+visible = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+colored = bool(re.search(r"\x1b\[[0-9;]*m", raw))
+sys.exit(0 if "> 查看详情" in visible and "> 启动节点" not in visible and colored == (mode == "color") else 1)
+' "$menu_view" "$color_mode"
+done
 
 # --- navigation -------------------------------------------------------------
 check 'menu returns the highlighted key' test "$(printf '\r' | ui_menu t p '1|one' '2|two')" = 1
@@ -119,15 +131,22 @@ restart_node isp1 >/dev/null
 check 'restart restarts the unit' grep -Fq 'start hy2m-isp1.service 8443' "$tmp/start-calls"
 
 # --- entry conditions -------------------------------------------------------
-ui_requested && fail 'panel requires a TTY' || pass 'panel requires a TTY'
-HY2M_UI=plain ui_requested && fail 'HY2M_UI=plain disables the panel' || pass 'HY2M_UI=plain disables the panel'
-TERM=dumb ui_requested && fail 'TERM=dumb disables the panel' || pass 'TERM=dumb disables the panel'
+if ui_requested; then fail 'panel requires a TTY'; else pass 'panel requires a TTY'; fi
+if HY2M_UI=plain ui_requested; then fail 'HY2M_UI=plain disables the panel'; else pass 'HY2M_UI=plain disables the panel'; fi
+if TERM=dumb ui_requested; then fail 'TERM=dumb disables the panel'; else pass 'TERM=dumb disables the panel'; fi
 
 # Without a TTY the classic numbered menu must still drive the manager.
 tput() { case $1 in cols) printf '40\n' ;; *) return 0 ;; esac; }
 choose() { printf '0\n'; }
 main_menu </dev/null >/dev/null 2>&1
 check 'plain menu still opens without a TTY' true
+
+# --- new entries ------------------------------------------------------------
+check 'node menu offers delete' grep -Fq 'x|删除此节点' <<<"$(declare -f ui_node_actions)"
+check 'node menu offers logs' grep -Fq '6|查看日志' <<<"$(declare -f ui_node_actions)"
+check 'node menu offers traffic' grep -Fq '7|运行时长与流量' <<<"$(declare -f ui_node_actions)"
+check 'node menu offers Clash export' grep -Fq 'e|导出 Clash/Mihomo YAML' <<<"$(declare -f ui_node_actions)"
+check 'cert menu offers domain change' grep -Fq '3|更换域名' <<<"$(declare -f ui_cert_menu)"
 
 if ((failures)); then
   printf '\n%d TUI test(s) failed.\n' "$failures" >&2

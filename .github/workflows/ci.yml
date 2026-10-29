@@ -24,14 +24,26 @@ jobs:
       - name: Contract tests
         run: bash tests/run.sh
       - name: UI and transaction tests
-        run: bash tests/ui-test.sh && python3 tests/tty-test.py
+        run: |
+          bash tests/ui-test.sh
+          bash tests/tui-test.sh
+          bash tests/client-export-test.sh
+          bash tests/tui-pagination-test.sh
+          bash tests/backup-restore-test.sh
+          bash tests/domain-transaction-test.sh
+          bash tests/certificate-rollback-test.sh
+          bash tests/initial-certificate-test.sh
+          bash tests/reliability-test.sh
+          bash tests/locking-test.sh
+          bash tests/renewal-test.sh
+          python3 tests/tty-test.py
       - name: Certificate guard tests
         run: bash tests/cert-guard-test.sh && bash tests/guard-discovery-test.sh
       - name: Pinned Hysteria config smoke test
         run: bash tests/hysteria-config-smoke.sh
       - name: Secret-pattern guard
         run: |
-          if grep -RIE --exclude-dir=.git --exclude=ci.yml '(dns_cloudflare_api_token[[:space:]]*=[[:space:]]*[A-Za-z0-9_-]{20,}|hysteria2://[A-Fa-f0-9]{32,}@)' .; then
+          if git grep -I -n -E '(dns_cloudflare_api_token[[:space:]]*=[[:space:]]*[A-Za-z0-9_-]{20,}|hysteria2://[A-Fa-f0-9]{32,}@)' -- . ':!.github/workflows/ci.yml'; then
             echo 'Possible committed credential detected.' >&2
             exit 1
           fi

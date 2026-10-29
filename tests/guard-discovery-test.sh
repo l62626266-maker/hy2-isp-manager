@@ -8,6 +8,8 @@ tmp=$(mktemp -d "$TMPDIR/guard-inventory.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 export HY2CG_SOURCE_ONLY=1
 export HY2CG_MANAGER_NODE_DIR="$tmp/nodes" HY2CG_MANAGER_CONFIG_DIR="$tmp/config"
+export HY2CG_MANAGER_STATE="$tmp/manager.env"
+printf 'DOMAIN=test.example.com\nPUBLIC_IP=192.0.2.1\nCERT_MODE=http\n' >"$HY2CG_MANAGER_STATE"
 source ./hy2-cert-guard
 mkdir -p "$HY2CG_MANAGER_NODE_DIR" "$HY2CG_MANAGER_CONFIG_DIR"
 # Fixture ownership is not root on developer machines; only this test stubs it.
